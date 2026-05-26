@@ -1,0 +1,356 @@
+# Claims Lifecycle Tracker — Project Report
+
+## What This Is
+
+A monorepo for a healthcare claims processing system. The goal is to track the full lifecycle of an insurance claim — from creation through validation, submission, adjudication, payment or denial — with a full audit trail of every status change.
+
+---
+
+## Repository Structure
+
+```
+ClaimsProcessing/
+├── .env.example
+├── .gitignore
+├── docker-compose.yml
+├── backend/
+│   ├── Dockerfile
+│   ├── entrypoint.sh
+│   ├── requirements.txt
+│   ├── alembic.ini
+│   ├── alembic/
+│   │   ├── env.py
+│   │   └── versions/
+│   │       └── e4384232efa6_initial.py
+│   └── app/
+│       ├── main.py
+│       ├── api/
+│       │   └── health.py
+│       ├── db/
+│       │   └── session.py
+│       ├── models/
+│       │   ├── enums.py
+│       │   ├── claim.py
+│       │   └── claim_event.py
+│       ├── schemas/       ← empty, Pydantic schemas go here
+│       └── rules/         ← empty, business logic goes here
+└── frontend/
+    ├── Dockerfile
+    ├── index.html
+    ├── package.json
+    ├── tsconfig.json
+    ├── tsconfig.node.json
+    ├── vite.config.ts
+    └── src/
+        ├── main.tsx
+        ├── App.tsx
+        └── vite-env.d.ts
+```
+
+---
+
+## Infrastructure — `docker-compose.yml`
+
+Three services:
+
+**db** — `postgres:16-alpine`. Runs with a named volume `pgdata` so data survives container restarts. Has a healthcheck using `pg_isready` that polls every 5 seconds. The `backend` service declares `depends_on: db: condition: service_healthy`, meaning Docker will not start the backend until Postgres passes the healthcheck. Credentials default to `claims/claims/claims` and can be overridden via `.env`.
+
+**backend** — Built from `./backend/Dockerfile`. Port 8000. Mounts `./backend:/app` as a volume so source changes are live without rebuilding. The `DATABASE_URL` in the container uses `db` as the hostname (the Docker service name), not `localhost`.
+
+**frontend** — Built from `./frontend/Dockerfile`. Port 5173. Has two volume mounts: `./frontend:/app` for live source, and `/app/node_modules` as an anonymous volume to prevent the host mount from wiping out the container's installed packages — a common Docker + Node gotcha.
+
+---
+
+## Backend
+
+### `Dockerfile` + `entrypoint.sh`
+
+The image is `python:3.12-slim`. At build time it installs all Python dependencies from `requirements.txt`. At runtime it calls `sh entrypoint.sh`, which does two things in sequence:
+
+```sh
+#!/bin/sh
+set -e
+alembic upgrade head
+exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+The `exec` replaces the shell process with uvicorn so uvicorn becomes PID 1 and receives signals (like SIGTERM on `docker stop`) correctly. `set -e` means if the migration fails, the container exits immediately rather than starting a broken server.
+
+### `requirements.txt`
+
+| Package | Version | Purpose |
+|---|---|---|
+| fastapi | 0.115.12 | Web framework |
+| uvicorn[standard] | 0.34.3 | ASGI server |
+| sqlalchemy | 2.0.41 | ORM |
+| psycopg2-binary | 2.9.10 | PostgreSQL driver |
+| python-dotenv | 1.1.0 | `.env` loading |
+| alembic | 1.16.1 | Migrations |
+
+All versions are pinned. `uvicorn[standard]` includes `websockets` and `httptools` for production-grade performance. `psycopg2-binary` bundles native libs so no C compiler is needed at build time. SQLAlchemy 2.0 is a major revision from 1.x with proper type annotation support via `Mapped`.
+
+### `app/main.py` — Entry Point
+
+```python
+app = FastAPI(title="Claims Lifecycle Tracker")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], ...)
+app.include_router(health_router)
+```
+
+`main.py` does nothing except create the app, configure middleware, and mount routers. No routes are defined here directly. As features are added, each gets its own router in `app/api/` and a single `include_router` line here.
+
+### `app/db/session.py` — Database Layer
+
+Three exports used throughout the app:
+
+- **`engine`** — the SQLAlchemy connection pool, created once at module load from `DATABASE_URL`
+- **`SessionLocal`** — a factory that produces database sessions. `autocommit=False` means you have to explicitly commit; `autoflush=False` means SQLAlchemy won't automatically sync state before queries
+- **`Base`** — all SQLAlchemy models inherit from this. It holds `metadata`, which is what Alembic inspects to detect schema changes
+- **`get_db()`** — a FastAPI dependency. Routes declare `db: Session = Depends(get_db)` and get a session that is automatically closed when the request finishes, even if it raises an exception
+
+### `app/models/enums.py`
+
+```python
+class ClaimStatus(str, enum.Enum):
+    CREATED = "CREATED"
+    VALIDATED = "VALIDATED"
+    SUBMITTED = "SUBMITTED"
+    ADJUDICATED = "ADJUDICATED"
+    PAID = "PAID"
+    DENIED = "DENIED"
+```
+
+`ClaimStatus` inherits from both `str` and `enum.Enum`. The `str` base means instances serialize directly to their string value in JSON — no custom serializer needed. Kept in its own file to avoid circular imports between `claim.py` and `claim_event.py`, both of which need it.
+
+### `app/models/claim.py` — The Core Entity
+
+```python
+class Claim(Base):
+    __tablename__ = "claims"
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    patient_name: Mapped[str] = mapped_column(String, nullable=False)
+    provider_name: Mapped[str] = mapped_column(String, nullable=False)
+    cpt_code: Mapped[str] = mapped_column(String, nullable=False)
+    diagnosis_code: Mapped[str] = mapped_column(String, nullable=False)
+    insurance_payer: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[ClaimStatus] = mapped_column(
+        Enum(ClaimStatus, name="claimstatus", native_enum=False), nullable=False, default=ClaimStatus.CREATED
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    events = relationship("ClaimEvent", back_populates="claim", cascade="all, delete-orphan")
+```
+
+Key decisions:
+
+- **UUID primary key** instead of integer — avoids leaking sequential IDs in the API, harder to enumerate records
+- **`native_enum=False`** — stores status as a VARCHAR with a check constraint rather than a PostgreSQL native ENUM type. Native enums in Postgres are harder to alter (adding a value requires a DDL statement that can lock the table and is difficult to roll back via Alembic)
+- **`cascade="all, delete-orphan"`** — deleting a Claim automatically deletes all its ClaimEvents at the ORM level
+- **`server_default=func.now()`** on timestamps — the default is set at the database level, not in Python, so it's accurate even if records are inserted bypassing the ORM
+
+### `app/models/claim_event.py` — The Audit Trail
+
+```python
+class ClaimEvent(Base):
+    __tablename__ = "claim_events"
+    id: Mapped[uuid.UUID] = ...
+    claim_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False
+    )
+    from_status: Mapped[ClaimStatus] = ...
+    to_status: Mapped[ClaimStatus] = ...
+    reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    triggered_at: Mapped[datetime] = ...
+```
+
+Every status change on a claim writes a ClaimEvent row capturing where it came from, where it went, and optionally why. `reason` is nullable because most transitions don't need explanation — denial does. The `ondelete="CASCADE"` on the foreign key ensures the database enforces deletion even on raw SQL bypassing the ORM.
+
+### Alembic — Migration System
+
+`alembic/env.py` has two key customizations over the default:
+
+```python
+from app.db.session import Base
+import app.models  # ensures all models are registered with Base.metadata
+
+database_url = os.getenv("DATABASE_URL", "postgresql://claims:claims@localhost:5432/claims")
+config.set_main_option("sqlalchemy.url", database_url)
+```
+
+Importing `app.models` is critical — Alembic uses `Base.metadata` to detect schema changes, and models only register themselves with `Base.metadata` when their module is imported. Without this import, autogenerate would see an empty schema and generate a migration that drops all your tables.
+
+The generated migration (`e4384232efa6_initial.py`) creates both tables. `claimstatus` is stored as a VARCHAR enum (not a native PG ENUM), so the migration doesn't need to create a type before the table.
+
+---
+
+## Frontend
+
+Vite + React + TypeScript. Currently just a shell — `App.tsx` renders an `<h1>`, `main.tsx` mounts it. `react-router-dom@7` is installed and ready. `vite-env.d.ts` types `import.meta.env.VITE_API_URL` so the API base URL is typed throughout the app.
+
+---
+
+## Runtime State
+
+| Service | Status | URL |
+|---|---|---|
+| PostgreSQL 16 | Running | localhost:5432 |
+| FastAPI | Running | http://localhost:8000 |
+| React/Vite | Running | http://localhost:5173 |
+
+Tables confirmed in the database:
+- `alembic_version` — tracks current migration revision
+- `claims` — core entity table
+- `claim_events` — audit trail table
+
+---
+
+## Interview Questions
+
+### Docker / Infrastructure
+
+**Q: Why does `depends_on` with a healthcheck matter here?**
+Without it, Docker starts the backend container as soon as the Postgres container *starts* — not when Postgres is actually ready to accept connections. The backend would crash on startup trying to connect to a Postgres that's still initializing. The healthcheck (`pg_isready`) makes Docker wait until the database is actually accepting connections.
+
+**Q: Why are there two volume mounts on the frontend container?**
+`./frontend:/app` gives the container live access to your source files. But it also overwrites `/app/node_modules` with your (empty) host directory, breaking all imports. The second mount `/app/node_modules` is an anonymous Docker volume that sits on top of the host mount specifically for that directory, preserving the packages installed during `docker build`.
+
+**Q: What does `exec` do in the entrypoint script and why does it matter?**
+`exec` replaces the shell process with uvicorn rather than spawning it as a child. Without `exec`, the shell is PID 1 and uvicorn is a child. When Docker sends SIGTERM to stop the container, the shell may not forward it to uvicorn, causing the container to hang until a SIGKILL timeout. With `exec`, uvicorn is PID 1 and receives the signal directly.
+
+### SQLAlchemy / Database
+
+**Q: What's the difference between `server_default` and `default` in SQLAlchemy?**
+`default` is applied by Python/SQLAlchemy before the INSERT — it generates the value in application code. `server_default` is a SQL expression sent as part of the column definition (e.g., `DEFAULT now()`) and applied by the database itself. `server_default` is more reliable because it works even on raw SQL inserts that bypass the ORM.
+
+**Q: Why use `native_enum=False` for `ClaimStatus`?**
+PostgreSQL native ENUMs are a DDL type — adding a new value requires `ALTER TYPE`. In Alembic, this is awkward to express and can't be cleanly rolled back. `native_enum=False` stores the value as VARCHAR with a check constraint. Adding a new status is then just adding it to the Python enum and running a migration that updates the check constraint, which is straightforward.
+
+**Q: Why is `app.models` imported in `alembic/env.py`?**
+SQLAlchemy models register themselves with `Base.metadata` only when their module is imported. Alembic autogenerate works by comparing `Base.metadata` (what your code says the schema should be) against the live database. If the models aren't imported, `metadata` is empty and autogenerate would produce a migration that drops all your tables.
+
+**Q: What is `get_db()` and why is it a generator?**
+It's a FastAPI dependency that yields a database session. Being a generator (using `yield`) allows code after the `yield` to run as cleanup after the request finishes — the `finally: db.close()` block runs whether the request succeeded or raised an exception. This guarantees sessions are always returned to the connection pool.
+
+**Q: Why use UUID primary keys instead of integers?**
+Integer keys are sequential and guessable — a user who sees `/claims/42` knows `/claims/43` probably exists and can try to access it. UUIDs are not enumerable. They also make it easier to merge data from multiple sources without key collisions, and to generate IDs client-side before hitting the database.
+
+### FastAPI
+
+**Q: Why are routes defined in separate files rather than in `main.py`?**
+Separation of concerns and scalability. `main.py` as an entry point that only mounts routers means you can add an entire new feature area (e.g., `app/api/claims.py`) with one line in `main.py`. It also makes testing easier — you can test a router in isolation without spinning up the full application.
+
+**Q: What does `ClaimStatus(str, enum.Enum)` give you over a plain `enum.Enum`?**
+The `str` mixin makes each enum member a real string subclass. FastAPI serializes it directly as a JSON string without a custom encoder. It also means you can compare `status == "DENIED"` without having to call `.value`. Without the `str` mixin, FastAPI would serialize it as `{"status": "DENIED"}` in some contexts and plain `"DENIED"` in others depending on how it's accessed.
+
+---
+
+### Project Structure — FastAPI Backend
+
+**Q: What does a well-structured FastAPI project look like and why?**
+A mature FastAPI project separates concerns into distinct layers:
+
+```
+app/
+├── main.py          # app factory only — middleware, router mounts
+├── api/             # one file per feature: claims.py, users.py, etc.
+├── models/          # SQLAlchemy ORM models (database shape)
+├── schemas/         # Pydantic models (API request/response shape)
+├── db/              # session factory, Base, get_db dependency
+├── rules/           # pure business logic, no framework dependencies
+└── dependencies/    # shared FastAPI dependencies (auth, pagination)
+```
+
+The key insight is that `models/` and `schemas/` are intentionally separate. Your ORM model is what the database looks like. Your Pydantic schema is what the API looks like. They are rarely identical — you don't want to expose `created_at` on a create request, or expose a password hash on a response. Keeping them separate means you control exactly what enters and exits the API boundary.
+
+**Q: What goes in `schemas/` vs `models/`?**
+`models/` contains SQLAlchemy classes that map to database tables — they define columns, relationships, and constraints. `schemas/` contains Pydantic classes that define what the API accepts and returns. For a claim you'd typically have:
+- `ClaimCreate` — what the client sends to create one (no `id`, no `status`, no timestamps)
+- `ClaimRead` — what the API returns (everything including computed fields)
+- `ClaimUpdate` — what the client sends to update one (all fields optional)
+
+FastAPI uses the schema for validation, serialization, and generating the OpenAPI docs at `/docs`.
+
+**Q: What is a FastAPI dependency and when would you use one?**
+A dependency is a function declared with `Depends()` that FastAPI calls automatically before your route handler. `get_db()` is a dependency — the route declares it needs a database session and FastAPI provides one. Common uses: database sessions, current authenticated user, pagination parameters, permission checks. Dependencies can depend on other dependencies, forming a tree that FastAPI resolves before calling the handler.
+
+**Q: What's the difference between a router and the main app?**
+`APIRouter` is a mini-application that groups related routes. You define routes on it exactly like you would on `app`, but it has no middleware or lifecycle of its own. `app.include_router(claims_router, prefix="/claims", tags=["claims"])` mounts it, automatically prefixing all its routes and grouping them in `/docs`. The main app (`FastAPI()`) is only created once in `main.py`; everything else is a router.
+
+---
+
+### Project Structure — React Frontend
+
+**Q: What does a well-structured React + TypeScript frontend look like?**
+A maintainable structure separates concerns by type and by feature:
+
+```
+src/
+├── main.tsx              # mounts React, wraps with providers
+├── App.tsx               # router definition only
+├── pages/                # one component per route: ClaimsList, ClaimDetail
+├── components/           # shared UI: Button, Badge, StatusPill
+├── hooks/                # custom hooks: useClaimsAPI, useClaimStatus
+├── api/                  # typed fetch functions for each endpoint
+├── types/                # TypeScript interfaces matching API schemas
+└── lib/                  # pure utilities: formatDate, formatCurrency
+```
+
+`pages/` are route-level components — they own data fetching and layout. `components/` are presentational and reusable — they receive props and render UI. The `api/` layer centralizes all `fetch` calls so if the API URL or auth header changes, it changes in one place.
+
+**Q: What is `vite-env.d.ts` doing?**
+It extends the global `ImportMeta` interface to tell TypeScript that `import.meta.env.VITE_API_URL` exists and is a string. Without it, TypeScript would error on any `import.meta.env` access because those are Vite-specific additions not in the standard TypeScript DOM types. Only variables prefixed with `VITE_` are exposed to the browser bundle — other env vars are stripped at build time.
+
+**Q: What is `tsconfig.node.json` for?**
+Vite has two runtime contexts: the browser bundle and the Node.js build tooling (`vite.config.ts` runs in Node, not the browser). They need different compiler settings — for example, `vite.config.ts` uses Node module resolution, not the browser bundler resolution. `tsconfig.node.json` applies only to `vite.config.ts`, while `tsconfig.json` applies to `src/`. The `references` field in `tsconfig.json` links them together so `tsc` knows about both.
+
+**Q: Why `react-router-dom` v7 specifically?**
+v7 is a full rewrite that merges React Router with Remix's data layer. It ships its own TypeScript types (no `@types/react-router-dom` needed). It introduces loader functions for route-level data fetching, replacing the pattern of fetching inside `useEffect` in a component. For this project it means claims data can load at the route level before the component renders, eliminating loading spinners for the initial page load.
+
+---
+
+### Schema Decisions
+
+**Q: Why does `ClaimEvent` record `from_status` and `to_status` rather than just `to_status`?**
+Recording both sides makes the audit log self-contained. You can answer questions like "how many claims went directly from SUBMITTED to DENIED without being ADJUDICATED?" with a single query. If you only stored `to_status`, you'd have to reconstruct the previous state by looking at the prior event, which breaks if events are ever missing or out of order.
+
+**Q: Why is `reason` on `ClaimEvent` rather than on `Claim`?**
+`reason` is a property of a specific transition, not of the claim itself. A claim might be denied, then resubmitted, then paid — each transition can have its own reason. If `reason` were on `Claim`, you'd only have the most recent one and would lose the history of why it was denied the first time.
+
+**Q: Why are both `created_at` and `updated_at` on `Claim` but only `triggered_at` on `ClaimEvent`?**
+`ClaimEvent` rows are immutable — they're written once when a transition happens and never changed. So `updated_at` doesn't make sense on them. `triggered_at` is the single timestamp of when that specific event occurred. `Claim` has both because the claim itself is mutable — its status, and potentially other fields, can be updated after creation.
+
+**Q: What's missing from the schema that a production system would need?**
+Several things: an `amount` or `billed_amount` field on `Claim` for the dollar value, an `adjudicated_amount` for what the insurer agreed to pay, a `user_id` or `submitted_by` foreign key to track who created the claim, an index on `claims.status` for efficiently querying claims in a given state, and an index on `claim_events.claim_id` for efficiently fetching the event history of a specific claim.
+
+---
+
+### Next Steps
+
+**Q: What would you build next on the backend?**
+The immediate next layer is:
+1. **Pydantic schemas** in `app/schemas/` — `ClaimCreate`, `ClaimRead`, `ClaimEventRead`
+2. **CRUD routes** in `app/api/claims.py` — `POST /claims`, `GET /claims`, `GET /claims/{id}`, `GET /claims/{id}/events`
+3. **Status transition endpoint** — `POST /claims/{id}/transition` with validation that the requested transition is legal (e.g., you can't go from PAID back to CREATED)
+4. **Transition rules** in `app/rules/` — a pure function that takes `(current_status, requested_status)` and returns whether it's allowed
+
+**Q: What would you build next on the frontend?**
+1. **API client** in `src/api/` — typed `fetchClaims()`, `fetchClaim(id)`, `createClaim()` functions using `VITE_API_URL`
+2. **Route structure** in `App.tsx` — `/claims` list view, `/claims/:id` detail view
+3. **ClaimsList page** — table of claims with status badges
+4. **ClaimDetail page** — claim fields plus timeline of ClaimEvents
+
+**Q: What would a status transition rule system look like?**
+A state machine — a dictionary mapping each status to the set of statuses it's allowed to transition to:
+
+```python
+ALLOWED_TRANSITIONS = {
+    ClaimStatus.CREATED:     {ClaimStatus.VALIDATED, ClaimStatus.DENIED},
+    ClaimStatus.VALIDATED:   {ClaimStatus.SUBMITTED, ClaimStatus.DENIED},
+    ClaimStatus.SUBMITTED:   {ClaimStatus.ADJUDICATED, ClaimStatus.DENIED},
+    ClaimStatus.ADJUDICATED: {ClaimStatus.PAID, ClaimStatus.DENIED},
+    ClaimStatus.PAID:        set(),
+    ClaimStatus.DENIED:      {ClaimStatus.SUBMITTED},  # allow resubmission
+}
+```
+
+A route calls `is_transition_allowed(current, requested)`, which looks up the set and returns a boolean. The `rules/` directory is the right home for this — it's pure logic with no database or framework dependencies, which makes it trivially testable.
