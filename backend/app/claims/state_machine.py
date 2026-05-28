@@ -20,7 +20,7 @@ ALLOWED_TRANSITIONS: dict[ClaimStatus, frozenset[ClaimStatus]] = {
     ClaimStatus.SUBMITTED:   frozenset({ClaimStatus.ADJUDICATED}),
     ClaimStatus.ADJUDICATED: frozenset({ClaimStatus.PAID, ClaimStatus.DENIED}),
     ClaimStatus.PAID:        frozenset(),
-    ClaimStatus.DENIED:      frozenset(),
+    ClaimStatus.DENIED:      frozenset({ClaimStatus.SUBMITTED}),
 }
 
 log = structlog.get_logger()

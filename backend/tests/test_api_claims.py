@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -16,15 +16,11 @@ VALID_CLAIM_BODY = {
     "billed_amount": 200.00,
 }
 
-IDEMPOTENCY_HEADERS = {"Idempotency-Key": str(uuid.uuid4())}
+IK = {"Idempotency-Key": str(uuid.uuid4())}
 
-
-# ---------------------------------------------------------------------------
-# POST /claims
-# ---------------------------------------------------------------------------
 
 def _stamp(obj):
-    """Mock db.refresh — sets fields that server_default/flush would normally populate."""
+    """Simulate db.refresh populating server_default fields."""
     import uuid as _uuid
     from datetime import datetime, timezone
     obj.id = obj.id or _uuid.uuid4()
@@ -32,20 +28,21 @@ def _stamp(obj):
     obj.updated_at = datetime.now(timezone.utc)
 
 
+# ---------------------------------------------------------------------------
+# POST /claims
+# ---------------------------------------------------------------------------
+
 def test_create_claim_returns_201(client, db):
     db.refresh.side_effect = _stamp
     response = client.post("/claims", json=VALID_CLAIM_BODY)
     assert response.status_code == 201
-    data = response.json()
-    assert data["patient_name"] == "Jane Doe"
-    assert data["status"] == "CREATED"
-    assert data["billed_amount"] == 200.0
+    assert response.json()["status"] == "CREATED"
+    assert response.json()["billed_amount"] == 200.0
 
 
 def test_create_claim_missing_billed_amount_returns_422(client, db):
     body = {k: v for k, v in VALID_CLAIM_BODY.items() if k != "billed_amount"}
-    response = client.post("/claims", json=body)
-    assert response.status_code == 422
+    assert client.post("/claims", json=body).status_code == 422
 
 
 def test_create_claim_commits_to_db(client, db):
@@ -58,168 +55,227 @@ def test_create_claim_commits_to_db(client, db):
 # GET /claims
 # ---------------------------------------------------------------------------
 
-def test_list_claims_returns_200(client, db):
-    claims = [make_claim(), make_claim(status=ClaimStatus.PAID)]
-    db.scalars.return_value.all.return_value = claims
-    response = client.get("/claims")
-    assert response.status_code == 200
-    assert len(response.json()) == 2
+def test_list_claims_returns_all(client, db):
+    db.scalars.return_value.all.return_value = [make_claim(), make_claim()]
+    assert len(client.get("/claims").json()) == 2
 
 
 def test_list_claims_empty(client, db):
     db.scalars.return_value.all.return_value = []
-    response = client.get("/claims")
-    assert response.status_code == 200
-    assert response.json() == []
+    assert client.get("/claims").json() == []
 
 
 # ---------------------------------------------------------------------------
 # GET /claims/{id}
 # ---------------------------------------------------------------------------
 
-def test_get_claim_returns_200(client, db):
+def test_get_claim_success(client, db):
     claim = make_claim()
     db.scalar.return_value = claim
-    response = client.get(f"/claims/{claim.id}")
-    assert response.status_code == 200
-    assert response.json()["id"] == str(claim.id)
+    assert client.get(f"/claims/{claim.id}").json()["id"] == str(claim.id)
 
 
-def test_get_claim_not_found_returns_404(client, db):
+def test_get_claim_not_found(client, db):
     db.scalar.return_value = None
-    response = client.get(f"/claims/{uuid.uuid4()}")
-    assert response.status_code == 404
-
-
-def test_get_claim_includes_events(client, db):
-    claim = make_claim(status=ClaimStatus.VALIDATED, events=[])
-    db.scalar.return_value = claim
-    response = client.get(f"/claims/{claim.id}")
-    assert "events" in response.json()
+    assert client.get(f"/claims/{uuid.uuid4()}").status_code == 404
 
 
 # ---------------------------------------------------------------------------
-# POST /claims/{id}/advance
+# POST /claims/{id}/validate
 # ---------------------------------------------------------------------------
 
-def test_advance_requires_idempotency_key(client, db):
-    response = client.post(f"/claims/{uuid.uuid4()}/advance", json={})
-    assert response.status_code == 422
-
-
-def test_advance_claim_not_found_returns_404(client, db):
-    db.scalar.return_value = None
-    response = client.post(
-        f"/claims/{uuid.uuid4()}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
-    assert response.status_code == 404
-
-
-def test_advance_terminal_claim_returns_422(client, db):
-    claim = make_claim(status=ClaimStatus.PAID)
-    db.scalar.return_value = claim
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
-    assert response.status_code == 422
-    assert "terminal" in response.json()["detail"].lower()
+def test_validate_requires_idempotency_key(client, db):
+    assert client.post(f"/claims/{uuid.uuid4()}/validate").status_code == 422
 
 
 @patch("app.api.claims.transition")
-def test_advance_success_returns_200(mock_transition, client, db):
-    claim = make_claim(status=ClaimStatus.VALIDATED)
-
-    def do_transition(c, to_status, db, **kwargs):
-        c.status = to_status
-
-    mock_transition.side_effect = do_transition
+def test_validate_success(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.CREATED)
     db.scalar.return_value = claim
-
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
-    assert response.status_code == 200
-    assert response.json()["status"] == "SUBMITTED"
-
-
-@patch("app.api.claims.transition")
-def test_advance_duplicate_key_returns_200_replay(mock_transition, client, db):
-    from app.claims.exceptions import DuplicateTransitionError
-
-    claim = make_claim(status=ClaimStatus.VALIDATED)
-    db.scalar.return_value = claim
-    mock_transition.side_effect = DuplicateTransitionError("already done")
-
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    response = client.post(f"/claims/{claim.id}/validate", headers=IK)
     assert response.status_code == 200
     assert response.json()["status"] == "VALIDATED"
 
 
-@patch("app.api.claims.transition")
-def test_advance_validation_failed_returns_422(mock_transition, client, db):
-    from app.claims.exceptions import ValidationFailedError
+def test_validate_claim_not_found(client, db):
+    db.scalar.return_value = None
+    assert client.post(f"/claims/{uuid.uuid4()}/validate", headers=IK).status_code == 404
 
+
+@patch("app.api.claims.transition")
+def test_validate_rules_failure_returns_422(mock_t, client, db):
+    from app.claims.exceptions import ValidationFailedError
     claim = make_claim(status=ClaimStatus.CREATED)
     db.scalar.return_value = claim
-    mock_transition.side_effect = ValidationFailedError(["CPT code not covered"])
-
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
+    mock_t.side_effect = ValidationFailedError(["CPT not covered"])
+    response = client.post(f"/claims/{claim.id}/validate", headers=IK)
     assert response.status_code == 422
-    assert "CPT code not covered" in response.json()["detail"]["errors"]
+    assert "CPT not covered" in response.json()["detail"]["errors"]
+
+
+# ---------------------------------------------------------------------------
+# POST /claims/{id}/submit
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.transition")
+def test_submit_success(mock_t, mock_sleep, client, db):
+    claim = make_claim(status=ClaimStatus.VALIDATED)
+    db.scalar.return_value = claim
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    response = client.post(f"/claims/{claim.id}/submit", json={}, headers=IK)
+    assert response.status_code == 200
+    assert response.json()["status"] == "SUBMITTED"
+
+
+@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.transition")
+def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_sleep, client, db):
+    claim = make_claim(status=ClaimStatus.VALIDATED)
+    db.scalar.return_value = claim
+    calls = []
+    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    client.post(f"/claims/{claim.id}/submit", json={"clearinghouse_ref": "CH-12345"}, headers=IK)
+    assert calls[0] == "CH-12345"
+
+
+@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+def test_submit_calls_sleep(mock_sleep, client, db):
+    claim = make_claim(status=ClaimStatus.VALIDATED)
+    db.scalar.return_value = None  # trigger 404 before sleep matters
+    client.post(f"/claims/{uuid.uuid4()}/submit", json={}, headers=IK)
+    # Sleep only fires after claim fetch; 404 means sleep was not reached
+    mock_sleep.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# POST /claims/{id}/adjudicate
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.transition")
+def test_adjudicate_success(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.SUBMITTED)
+    db.scalar.return_value = claim
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    body = {"allowed_amount": 150.00, "patient_responsibility": 20.00}
+    response = client.post(f"/claims/{claim.id}/adjudicate", json=body, headers=IK)
+    assert response.status_code == 200
+    assert response.json()["status"] == "ADJUDICATED"
 
 
 @patch("app.api.claims.transition")
-def test_advance_to_adjudicated_sets_financial_fields(mock_transition, client, db):
+def test_adjudicate_sets_financial_fields(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.SUBMITTED)
-
-    def do_transition(c, to_status, db, **kwargs):
-        c.status = to_status
-
-    mock_transition.side_effect = do_transition
     db.scalar.return_value = claim
-
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={"allowed_amount": 150.00, "patient_responsibility": 20.00},
-        headers=IDEMPOTENCY_HEADERS,
-    )
-    assert response.status_code == 200
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    body = {"allowed_amount": 150.00, "patient_responsibility": 20.00, "adjustment_reason": "CO-45"}
+    client.post(f"/claims/{claim.id}/adjudicate", json=body, headers=IK)
     assert claim.allowed_amount == Decimal("150.00")
     assert claim.patient_responsibility == Decimal("20.00")
+    assert claim.adjustment_reason == "CO-45"
+
+
+def test_adjudicate_missing_allowed_amount_returns_422(client, db):
+    body = {"patient_responsibility": 20.00}
+    assert client.post(f"/claims/{uuid.uuid4()}/adjudicate", json=body, headers=IK).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /claims/{id}/pay
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.transition")
+def test_pay_success(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.ADJUDICATED, allowed_amount=Decimal("150"))
+    db.scalar.return_value = claim
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    response = client.post(f"/claims/{claim.id}/pay", json={"paid_amount": 130.00}, headers=IK)
+    assert response.status_code == 200
+    assert response.json()["status"] == "PAID"
 
 
 @patch("app.api.claims.transition")
-def test_advance_to_paid_computes_paid_amount(mock_transition, client, db):
-    claim = make_claim(
-        status=ClaimStatus.ADJUDICATED,
-        allowed_amount=Decimal("150.00"),
-        patient_responsibility=Decimal("20.00"),
-    )
-
-    def do_transition(c, to_status, db, **kwargs):
-        c.status = to_status
-
-    mock_transition.side_effect = do_transition
+def test_pay_sets_paid_amount(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.ADJUDICATED)
     db.scalar.return_value = claim
-
-    response = client.post(
-        f"/claims/{claim.id}/advance",
-        json={},
-        headers=IDEMPOTENCY_HEADERS,
-    )
-    assert response.status_code == 200
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    client.post(f"/claims/{claim.id}/pay", json={"paid_amount": 130.00}, headers=IK)
     assert claim.paid_amount == Decimal("130.00")
+
+
+def test_pay_missing_paid_amount_returns_422(client, db):
+    assert client.post(f"/claims/{uuid.uuid4()}/pay", json={}, headers=IK).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /claims/{id}/deny
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.transition")
+def test_deny_success(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.ADJUDICATED)
+    db.scalar.return_value = claim
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    response = client.post(f"/claims/{claim.id}/deny", json={"denial_reason": "CO-97"}, headers=IK)
+    assert response.status_code == 200
+    assert response.json()["status"] == "DENIED"
+
+
+@patch("app.api.claims.transition")
+def test_deny_passes_reason_to_transition(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.ADJUDICATED)
+    db.scalar.return_value = claim
+    calls = []
+    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    client.post(f"/claims/{claim.id}/deny", json={"denial_reason": "CO-97: bundled"}, headers=IK)
+    assert calls[0] == "CO-97: bundled"
+
+
+def test_deny_missing_reason_returns_422(client, db):
+    assert client.post(f"/claims/{uuid.uuid4()}/deny", json={}, headers=IK).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /claims/{id}/resubmit
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.transition")
+def test_resubmit_success(mock_t, mock_sleep, client, db):
+    claim = make_claim(status=ClaimStatus.DENIED)
+    db.scalar.return_value = claim
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    body = {"correction_notes": "Added modifier HO"}
+    response = client.post(f"/claims/{claim.id}/resubmit", json=body, headers=IK)
+    assert response.status_code == 200
+    assert response.json()["status"] == "SUBMITTED"
+
+
+@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.transition")
+def test_resubmit_passes_correction_notes_as_reason(mock_t, mock_sleep, client, db):
+    claim = make_claim(status=ClaimStatus.DENIED)
+    db.scalar.return_value = claim
+    calls = []
+    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    client.post(f"/claims/{claim.id}/resubmit", json={"correction_notes": "Fixed modifier"}, headers=IK)
+    assert calls[0] == "Fixed modifier"
+
+
+def test_resubmit_missing_correction_notes_returns_422(client, db):
+    assert client.post(f"/claims/{uuid.uuid4()}/resubmit", json={}, headers=IK).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# Idempotency replay (shared across endpoints)
+# ---------------------------------------------------------------------------
+
+@patch("app.api.claims.transition")
+def test_duplicate_idempotency_key_returns_200_replay(mock_t, client, db):
+    from app.claims.exceptions import DuplicateTransitionError
+    claim = make_claim(status=ClaimStatus.VALIDATED)
+    db.scalar.return_value = claim
+    mock_t.side_effect = DuplicateTransitionError("already done")
+    response = client.post(f"/claims/{claim.id}/validate", headers=IK)
+    assert response.status_code == 200

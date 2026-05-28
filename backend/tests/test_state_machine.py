@@ -51,9 +51,12 @@ def test_all_statuses_present_in_transition_table():
         assert status in ALLOWED_TRANSITIONS
 
 
-def test_terminal_statuses_have_no_transitions():
+def test_paid_is_terminal():
     assert ALLOWED_TRANSITIONS[ClaimStatus.PAID] == frozenset()
-    assert ALLOWED_TRANSITIONS[ClaimStatus.DENIED] == frozenset()
+
+
+def test_denied_allows_resubmission():
+    assert ClaimStatus.SUBMITTED in ALLOWED_TRANSITIONS[ClaimStatus.DENIED]
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +98,14 @@ def test_adjudicated_to_denied():
     assert event.reason == "Plan limit exceeded"
 
 
+def test_denied_to_submitted_resubmission():
+    claim = make_claim(status=ClaimStatus.DENIED)
+    event = transition(claim, ClaimStatus.SUBMITTED, make_db(), reason="Corrected codes")
+    assert event.to_status == ClaimStatus.SUBMITTED
+    assert event.reason == "Corrected codes"
+    assert claim.status == ClaimStatus.SUBMITTED
+
+
 # ---------------------------------------------------------------------------
 # Invalid transitions
 # ---------------------------------------------------------------------------
@@ -106,9 +117,9 @@ def test_adjudicated_to_denied():
     (ClaimStatus.VALIDATED,   ClaimStatus.ADJUDICATED),    # skip SUBMITTED
     (ClaimStatus.SUBMITTED,   ClaimStatus.VALIDATED),      # backwards
     (ClaimStatus.SUBMITTED,   ClaimStatus.PAID),           # skip ADJUDICATED
-    (ClaimStatus.PAID,        ClaimStatus.DENIED),         # terminal
-    (ClaimStatus.PAID,        ClaimStatus.CREATED),        # terminal backwards
-    (ClaimStatus.DENIED,      ClaimStatus.PAID),           # terminal
+    (ClaimStatus.PAID,        ClaimStatus.DENIED),         # terminal → invalid
+    (ClaimStatus.PAID,        ClaimStatus.CREATED),        # terminal → invalid
+    (ClaimStatus.DENIED,      ClaimStatus.PAID),           # denied can only resubmit
 ])
 def test_invalid_transition_raises(from_s, to_s):
     claim = make_claim(status=from_s)

@@ -19,30 +19,53 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export const fetchClaims = () =>
-  request<Claim[]>('/claims')
+function withKey(extra?: Record<string, string>): HeadersInit {
+  return { 'Content-Type': 'application/json', 'Idempotency-Key': crypto.randomUUID(), ...extra }
+}
 
-export const fetchClaim = (id: string) =>
-  request<ClaimDetail>(`/claims/${id}`)
+export const fetchClaims = () => request<Claim[]>('/claims')
+
+export const fetchClaim = (id: string) => request<ClaimDetail>(`/claims/${id}`)
 
 export const createClaim = (data: object) =>
   request<Claim>('/claims', { method: 'POST', body: JSON.stringify(data) })
 
-export interface AdvanceBody {
-  reason?: string
-  allowed_amount?: number
-  patient_responsibility?: number
-  adjustment_reason?: string
-}
+export const validateClaim = (id: string) =>
+  request<ClaimDetail>(`/claims/${id}/validate`, { method: 'POST', headers: withKey() })
 
-export const advanceClaim = (id: string, body: AdvanceBody = {}) =>
-  request<ClaimDetail>(`/claims/${id}/advance`, {
+export const submitClaim = (id: string, clearinghouse_ref?: string) =>
+  request<ClaimDetail>(`/claims/${id}/submit`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Idempotency-Key': crypto.randomUUID(),
-    },
-    body: JSON.stringify({ reason: null, ...body }),
+    headers: withKey(),
+    body: JSON.stringify({ clearinghouse_ref: clearinghouse_ref ?? null }),
+  })
+
+export const adjudicateClaim = (id: string, allowed_amount: number, patient_responsibility: number, adjustment_reason?: string) =>
+  request<ClaimDetail>(`/claims/${id}/adjudicate`, {
+    method: 'POST',
+    headers: withKey(),
+    body: JSON.stringify({ allowed_amount, patient_responsibility, adjustment_reason: adjustment_reason ?? null }),
+  })
+
+export const payClaim = (id: string, paid_amount: number) =>
+  request<ClaimDetail>(`/claims/${id}/pay`, {
+    method: 'POST',
+    headers: withKey(),
+    body: JSON.stringify({ paid_amount }),
+  })
+
+export const denyClaim = (id: string, denial_reason: string) =>
+  request<ClaimDetail>(`/claims/${id}/deny`, {
+    method: 'POST',
+    headers: withKey(),
+    body: JSON.stringify({ denial_reason }),
+  })
+
+export const resubmitClaim = (id: string, correction_notes: string) =>
+  request<ClaimDetail>(`/claims/${id}/resubmit`, {
+    method: 'POST',
+    headers: withKey(),
+    body: JSON.stringify({ correction_notes }),
   })
 
 export function parseApiError(e: unknown): string {

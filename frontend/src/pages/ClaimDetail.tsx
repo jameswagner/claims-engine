@@ -1,10 +1,11 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { advanceClaim, fetchClaim, parseApiError } from '../api/claims'
+import {
+  adjudicateClaim, denyClaim, fetchClaim, payClaim,
+  parseApiError, resubmitClaim, submitClaim, validateClaim,
+} from '../api/claims'
 import { StatusBadge } from '../components/StatusBadge'
 import type { ClaimDetail as ClaimDetailType } from '../types/claim'
-
-const TERMINAL = new Set(['PAID', 'DENIED'])
 
 function formatDate(iso: string) {
   return new Date(iso).toLocaleString('en-US', {
@@ -18,34 +19,62 @@ function formatCurrency(n: number | null) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 }
 
+type Action = {
+  label: string
+  handler: () => Promise<ClaimDetailType>
+}
+
+function nextAction(claim: ClaimDetailType): Action | null {
+  switch (claim.status) {
+    case 'CREATED':
+      return { label: 'Validate →', handler: () => validateClaim(claim.id) }
+    case 'VALIDATED':
+      return { label: 'Submit to Clearinghouse →', handler: () => submitClaim(claim.id) }
+    case 'SUBMITTED':
+      return {
+        label: 'Record Adjudication →',
+        handler: () => adjudicateClaim(claim.id, 150.00, 20.00, 'CO-45: charge exceeds fee schedule'),
+      }
+    case 'ADJUDICATED':
+      return { label: 'Record Payment →', handler: () => payClaim(claim.id, 130.00) }
+    case 'DENIED':
+      return {
+        label: 'Resubmit →',
+        handler: () => resubmitClaim(claim.id, 'Corrected CPT codes and modifiers'),
+      }
+    default:
+      return null
+  }
+}
+
+function denyAction(claim: ClaimDetailType): Action | null {
+  if (claim.status !== 'ADJUDICATED') return null
+  return {
+    label: 'Deny',
+    handler: () => denyClaim(claim.id, 'CO-97: procedure bundled'),
+  }
+}
+
 export function ClaimDetail() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
   const [claim, setClaim] = useState<ClaimDetailType | null>(null)
-  const [advancing, setAdvancing] = useState(false)
+  const [working, setWorking] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (id) fetchClaim(id).then(setClaim).catch(() => setError('Claim not found'))
   }, [id])
 
-  async function handleAdvance() {
-    if (!claim) return
-    setAdvancing(true)
+  async function run(action: Action) {
+    setWorking(true)
     setError(null)
     try {
-      // Pass demo financial fields when adjudicating so the UI shows real numbers
-      const financialFields = claim.status === 'SUBMITTED' ? {
-        allowed_amount: 150.00,
-        patient_responsibility: 20.00,
-        adjustment_reason: 'CO-45: charge exceeds fee schedule',
-      } : {}
-      const updated = await advanceClaim(claim.id, financialFields)
-      setClaim(updated)
+      setClaim(await action.handler())
     } catch (e) {
       setError(parseApiError(e))
     } finally {
-      setAdvancing(false)
+      setWorking(false)
     }
   }
 
@@ -57,7 +86,8 @@ export function ClaimDetail() {
     )
   }
 
-  const isTerminal = TERMINAL.has(claim.status)
+  const primary = nextAction(claim)
+  const deny = denyAction(claim)
   const hasFinancials = claim.allowed_amount !== null || claim.paid_amount !== null
 
   return (
@@ -82,26 +112,11 @@ export function ClaimDetail() {
           </div>
 
           <dl className="grid grid-cols-2 gap-x-8 gap-y-4 text-sm">
-            <div>
-              <dt className="text-gray-400">Provider</dt>
-              <dd className="font-medium text-gray-900 mt-0.5">{claim.provider_name}</dd>
-            </div>
-            <div>
-              <dt className="text-gray-400">Payer</dt>
-              <dd className="font-medium text-gray-900 mt-0.5">{claim.insurance_payer}</dd>
-            </div>
-            <div>
-              <dt className="text-gray-400">CPT Code</dt>
-              <dd className="font-medium font-mono text-gray-900 mt-0.5">{claim.cpt_code}</dd>
-            </div>
-            <div>
-              <dt className="text-gray-400">Diagnosis</dt>
-              <dd className="font-medium font-mono text-gray-900 mt-0.5">{claim.diagnosis_code}</dd>
-            </div>
-            <div>
-              <dt className="text-gray-400">Billed</dt>
-              <dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.billed_amount)}</dd>
-            </div>
+            <div><dt className="text-gray-400">Provider</dt><dd className="font-medium text-gray-900 mt-0.5">{claim.provider_name}</dd></div>
+            <div><dt className="text-gray-400">Payer</dt><dd className="font-medium text-gray-900 mt-0.5">{claim.insurance_payer}</dd></div>
+            <div><dt className="text-gray-400">CPT Code</dt><dd className="font-medium font-mono text-gray-900 mt-0.5">{claim.cpt_code}</dd></div>
+            <div><dt className="text-gray-400">Diagnosis</dt><dd className="font-medium font-mono text-gray-900 mt-0.5">{claim.diagnosis_code}</dd></div>
+            <div><dt className="text-gray-400">Billed</dt><dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.billed_amount)}</dd></div>
           </dl>
 
           {hasFinancials && (
@@ -109,66 +124,61 @@ export function ClaimDetail() {
               <p className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-3">Financials</p>
               <dl className="grid grid-cols-2 gap-x-8 gap-y-4 text-sm">
                 {claim.allowed_amount !== null && (
-                  <div>
-                    <dt className="text-gray-400">Allowed</dt>
-                    <dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.allowed_amount)}</dd>
-                  </div>
+                  <div><dt className="text-gray-400">Allowed</dt><dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.allowed_amount)}</dd></div>
                 )}
                 {claim.patient_responsibility !== null && (
-                  <div>
-                    <dt className="text-gray-400">Patient Resp.</dt>
-                    <dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.patient_responsibility)}</dd>
-                  </div>
+                  <div><dt className="text-gray-400">Patient Resp.</dt><dd className="font-medium text-gray-900 mt-0.5">{formatCurrency(claim.patient_responsibility)}</dd></div>
                 )}
                 {claim.paid_amount !== null && (
-                  <div>
-                    <dt className="text-gray-400">Paid</dt>
-                    <dd className="font-medium text-green-700 mt-0.5">{formatCurrency(claim.paid_amount)}</dd>
-                  </div>
+                  <div><dt className="text-gray-400">Paid</dt><dd className="font-medium text-green-700 mt-0.5">{formatCurrency(claim.paid_amount)}</dd></div>
                 )}
                 {claim.adjustment_reason && (
-                  <div className="col-span-2">
-                    <dt className="text-gray-400">Adjustment</dt>
-                    <dd className="font-medium text-gray-900 mt-0.5">{claim.adjustment_reason}</dd>
-                  </div>
+                  <div className="col-span-2"><dt className="text-gray-400">Adjustment</dt><dd className="font-medium text-gray-900 mt-0.5">{claim.adjustment_reason}</dd></div>
                 )}
               </dl>
             </div>
           )}
         </div>
 
-        {/* Advance button */}
-        <div className="mb-4">
-          <button
-            onClick={handleAdvance}
-            disabled={advancing || isTerminal}
-            className="w-full py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
-          >
-            {advancing
-              ? 'Advancing…'
-              : isTerminal
-              ? `Claim is ${claim.status} — no further transitions`
-              : 'Advance Claim →'}
-          </button>
-          {error && (
-            <p className="mt-2 text-sm text-red-600">{error}</p>
+        {/* Action buttons */}
+        <div className="flex gap-3 mb-4">
+          {primary ? (
+            <button
+              onClick={() => run(primary)}
+              disabled={working}
+              className="flex-1 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {working ? 'Working…' : primary.label}
+            </button>
+          ) : (
+            <div className="flex-1 py-2.5 rounded-lg text-sm font-medium text-center text-gray-400 bg-gray-100">
+              Claim is {claim.status} — no further transitions
+            </div>
+          )}
+
+          {deny && (
+            <button
+              onClick={() => run(deny)}
+              disabled={working}
+              className="px-4 py-2.5 rounded-lg text-sm font-medium transition-colors bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              Deny
+            </button>
           )}
         </div>
+
+        {error && <p className="mb-4 text-sm text-red-600">{error}</p>}
 
         {/* Event timeline */}
         {claim.events.length > 0 && (
           <div className="bg-white rounded-xl shadow-sm border border-gray-100 p-6">
-            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-5">
-              Event Timeline
-            </h2>
+            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-widest mb-5">Event Timeline</h2>
             <ol>
               {claim.events.map((event, i) => (
                 <li key={event.id} className="flex gap-4">
                   <div className="flex flex-col items-center">
                     <div className="w-2.5 h-2.5 rounded-full bg-blue-400 mt-0.5 shrink-0" />
-                    {i < claim.events.length - 1 && (
-                      <div className="w-px flex-1 bg-gray-100 my-1" />
-                    )}
+                    {i < claim.events.length - 1 && <div className="w-px flex-1 bg-gray-100 my-1" />}
                   </div>
                   <div className="pb-5 min-w-0">
                     <div className="flex items-center gap-2 flex-wrap">
@@ -176,9 +186,7 @@ export function ClaimDetail() {
                       <StatusBadge status={event.to_status} />
                     </div>
                     <p className="text-xs text-gray-400 mt-1">{formatDate(event.triggered_at)}</p>
-                    {event.reason && (
-                      <p className="text-xs text-gray-500 mt-1 italic">"{event.reason}"</p>
-                    )}
+                    {event.reason && <p className="text-xs text-gray-500 mt-1 italic">"{event.reason}"</p>}
                   </div>
                 </li>
               ))}

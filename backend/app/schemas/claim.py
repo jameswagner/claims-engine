@@ -53,8 +53,24 @@ class ClaimDetail(ClaimRead):
     events: list[ClaimEventRead] = []
 
 
-class AdvanceRequest(BaseModel):
-    reason: str | None = None
-    allowed_amount: Decimal | None = None
-    patient_responsibility: Decimal | None = None
+class SubmitRequest(BaseModel):
+    clearinghouse_ref: str | None = None
+
+
+class AdjudicateRequest(BaseModel):
+    allowed_amount: Decimal
+    patient_responsibility: Decimal
     adjustment_reason: str | None = None
+
+
+class PayRequest(BaseModel):
+    paid_amount: Decimal
+
+
+class DenyRequest(BaseModel):
+    denial_reason: str
+
+
+class ResubmitRequest(BaseModel):
+    correction_notes: str
+    clearinghouse_ref: str | None = None

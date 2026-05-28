@@ -75,7 +75,12 @@ cd backend
 | `POST` | `/claims` | Create a new claim |
 | `GET` | `/claims` | List all claims |
 | `GET` | `/claims/{id}` | Get claim with full event history |
-| `POST` | `/claims/{id}/advance` | Advance to the next state |
+| `POST` | `/claims/{id}/validate` | Run rules engine, CREATED → VALIDATED |
+| `POST` | `/claims/{id}/submit` | Submit to clearinghouse, VALIDATED → SUBMITTED |
+| `POST` | `/claims/{id}/adjudicate` | Record adjudication with financial terms |
+| `POST` | `/claims/{id}/pay` | Record payment, ADJUDICATED → PAID |
+| `POST` | `/claims/{id}/deny` | Record denial with reason, ADJUDICATED → DENIED |
+| `POST` | `/claims/{id}/resubmit` | Correction flow, DENIED → SUBMITTED |
 | `POST` | `/claims/{id}/remit` | Submit remit (EOB) for an adjudicated claim |
 | `GET` | `/claims/{id}/remit` | Get the remit with all adjustment codes |
 
