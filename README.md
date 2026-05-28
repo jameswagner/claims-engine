@@ -76,12 +76,16 @@ cd backend
 | `GET` | `/claims` | List all claims |
 | `GET` | `/claims/{id}` | Get claim with full event history |
 | `POST` | `/claims/{id}/advance` | Advance to the next state |
+| `POST` | `/claims/{id}/remit` | Submit remit (EOB) for an adjudicated claim |
+| `GET` | `/claims/{id}/remit` | Get the remit with all adjustment codes |
 
 ---
 
 ## Engineering Decisions
 
 - **Client-supplied idempotency keys.** `POST /claims/{id}/advance` requires an `Idempotency-Key` header (a UUID the caller generates). The key is stored on the `ClaimEvent` with a unique index — a duplicate key returns the original response (200 replay) rather than a 409, matching the Stripe pattern. This is intentionally caller-controlled rather than server-computed: a server-computed key based on `(claim_id, to_status)` would silently block legitimate resubmissions in workflows where a claim visits the same state more than once (e.g. deny → correct → resubmit → deny again).
+
+- **Remit (EOB) processing.** `POST /claims/{id}/remit` accepts a remit payload against an ADJUDICATED claim — raw response text, totals, and an array of adjustment codes (`CO-97`, `PR-1`, etc.). Each code is resolved against a library (`seed_remit_codes.py`) that maps code → category, description, and `action_required` (e.g. "Bill patient", "Resubmit unbundled or write off"). Unknown codes are accepted with a generic fallback rather than rejected, since real remits routinely include codes outside any static list. Posting a remit also updates `claim.allowed_amount` and `claim.paid_amount` from the remit totals, keeping the claim's financial state in sync.
 
 - **Financial fields with lifecycle semantics.** `Claim` carries `billed_amount` (always set at creation), `allowed_amount` and `patient_responsibility` (set at adjudication), and `paid_amount` (auto-computed as `allowed - patient_responsibility` on the PAID transition). `adjustment_reason` carries the remit code explanation (e.g. `CO-45: charge exceeds fee schedule`). All stored as `Numeric(10,2)` — no float rounding — and serialized to JSON as numbers via a Pydantic field serializer.
 

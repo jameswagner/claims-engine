@@ -106,6 +106,25 @@ _Update this after each build prompt._
 
 ---
 
+## SEGMENT 5b — REMIT PROCESSING (30 seconds)
+> "Once a claim is adjudicated, the payer sends back
+> an Explanation of Benefits — a remit. Each remit
+> contains adjustment codes: CO-97 means the procedure
+> was bundled, PR-1 is patient deductible, OA-23 is
+> a coordination of benefits adjustment. We store the
+> raw remit, parse each code against a library that
+> maps it to a human-readable action — 'bill patient',
+> 'resubmit unbundled' — and update the claim's
+> financial fields from the remit totals."
+
+**Show:**
+- `POST /claims/{id}/remit` via curl or Swagger UI — submit a remit with CO-45 and PR-1 codes
+- `GET /claims/{id}/remit` — show the response with codes, descriptions, action_required
+
+**STATUS: Ready to record.** Remit model, RemitCode model, code library, and API endpoints all in place.
+
+---
+
 ## SEGMENT 6 — OBSERVABILITY + SCALE (45 seconds)
 > "Before I talk about what I'd add at scale —
 > the observability is already wired. Every request

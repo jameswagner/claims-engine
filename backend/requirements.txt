@@ -6,4 +6,5 @@ python-dotenv==1.1.0
 alembic==1.16.1
 structlog==24.4.0
 pytest==8.3.5
+httpx==0.28.1
 
