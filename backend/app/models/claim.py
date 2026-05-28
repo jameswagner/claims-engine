@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Enum, String, DateTime, func
+from sqlalchemy import Enum, String, DateTime, Numeric, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -23,6 +24,11 @@ class Claim(Base):
         nullable=False,
         default=ClaimStatus.CREATED,
     )
+    billed_amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False, server_default="0")
+    allowed_amount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    paid_amount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    patient_responsibility: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    adjustment_reason: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

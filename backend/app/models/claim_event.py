@@ -23,6 +23,7 @@ class ClaimEvent(Base):
         Enum(ClaimStatus, name="claimstatus", native_enum=False), nullable=False
     )
     reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True, index=True)
     triggered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
     claim = relationship("Claim", back_populates="events")
