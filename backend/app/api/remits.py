@@ -1,7 +1,8 @@
 import uuid
+from typing import Annotated
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -19,7 +20,12 @@ log = structlog.get_logger()
 
 
 @router.post("/{claim_id}/remit", response_model=RemitRead, status_code=201)
-def create_remit(claim_id: uuid.UUID, body: RemitCreate, db: Session = Depends(get_db)):
+def create_remit(
+    claim_id: uuid.UUID,
+    body: RemitCreate,
+    idempotency_key: Annotated[str, Header()],
+    db: Session = Depends(get_db),
+):
     claim = db.scalar(select(Claim).where(Claim.id == claim_id))
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
@@ -28,11 +34,18 @@ def create_remit(claim_id: uuid.UUID, body: RemitCreate, db: Session = Depends(g
             status_code=422,
             detail=f"Claim must be ADJUDICATED to receive a remit (current: {claim.status.value})",
         )
-    if db.scalar(select(Remit).where(Remit.claim_id == claim_id)):
+
+    existing = db.scalar(select(Remit).where(Remit.claim_id == claim_id))
+    if existing:
+        if existing.idempotency_key == idempotency_key:
+            return db.scalar(
+                select(Remit).where(Remit.id == existing.id).options(selectinload(Remit.codes))
+            )
         raise HTTPException(status_code=409, detail="Remit already exists for this claim")
 
     remit = Remit(
         claim_id=claim_id,
+        idempotency_key=idempotency_key,
         raw_response=body.raw_response,
         total_billed=body.total_billed,
         total_allowed=body.total_allowed,
@@ -56,7 +69,6 @@ def create_remit(claim_id: uuid.UUID, body: RemitCreate, db: Session = Depends(g
     claim.paid_amount = body.total_paid
 
     db.commit()
-    db.refresh(remit)
 
     log.info(
         "remit_processed",
