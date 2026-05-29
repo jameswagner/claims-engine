@@ -14,7 +14,7 @@ class ClaimEvent(Base):
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     claim_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False
+        UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False, index=True
     )
     from_status: Mapped[ClaimStatus] = mapped_column(
         Enum(ClaimStatus, name="claimstatus", native_enum=False), nullable=False
