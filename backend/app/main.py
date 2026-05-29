@@ -17,7 +17,7 @@ log = structlog.get_logger()
 
 app = FastAPI(title="Claims Lifecycle Tracker")
 
-_origins = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+_origins = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")]
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,16 +36,17 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
     start = time.perf_counter()
     log.info("request_started", method=request.method, path=request.url.path)
 
-    response = await call_next(request)
-
-    duration_ms = round((time.perf_counter() - start) * 1000, 1)
-    log.info(
-        "request_finished",
-        method=request.method,
-        path=request.url.path,
-        status_code=response.status_code,
-        duration_ms=duration_ms,
-    )
+    try:
+        response = await call_next(request)
+    finally:
+        duration_ms = round((time.perf_counter() - start) * 1000, 1)
+        log.info(
+            "request_finished",
+            method=request.method,
+            path=request.url.path,
+            status_code=getattr(response, "status_code", 500),
+            duration_ms=duration_ms,
+        )
 
     response.headers["X-Request-ID"] = request_id
     return response

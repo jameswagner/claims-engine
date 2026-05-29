@@ -29,6 +29,7 @@ def configure_logging() -> None:
     else:
         processors = shared_processors + [
             structlog.processors.format_exc_info,
+            structlog.processors.EventRenamer(to="message"),
             structlog.processors.JSONRenderer(),
         ]
 
@@ -39,3 +40,8 @@ def configure_logging() -> None:
         logger_factory=structlog.PrintLoggerFactory(),
         cache_logger_on_first_use=True,
     )
+
+    # Suppress uvicorn's built-in access log — the request_logging_middleware
+    # already logs every request through structlog, avoiding duplicate entries.
+    logging.getLogger("uvicorn.access").propagate = False
+    logging.getLogger("uvicorn.access").handlers = []

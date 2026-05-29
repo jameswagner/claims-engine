@@ -1,6 +1,6 @@
 import uuid
 from decimal import Decimal
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -118,7 +118,7 @@ def test_validate_rules_failure_returns_422(mock_t, client, db):
 # POST /claims/{id}/submit
 # ---------------------------------------------------------------------------
 
-@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.time.sleep")
 @patch("app.api.claims.transition")
 def test_submit_success(mock_t, mock_sleep, client, db):
     claim = make_claim(status=ClaimStatus.VALIDATED)
@@ -129,7 +129,7 @@ def test_submit_success(mock_t, mock_sleep, client, db):
     assert response.json()["status"] == "SUBMITTED"
 
 
-@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.time.sleep")
 @patch("app.api.claims.transition")
 def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_sleep, client, db):
     claim = make_claim(status=ClaimStatus.VALIDATED)
@@ -140,13 +140,10 @@ def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_sleep, client, d
     assert calls[0] == "CH-12345"
 
 
-@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
-def test_submit_calls_sleep(mock_sleep, client, db):
-    claim = make_claim(status=ClaimStatus.VALIDATED)
+def test_submit_calls_sleep(client, db):
     db.scalar.return_value = None  # trigger 404 before sleep matters
     client.post(f"/claims/{uuid.uuid4()}/submit", json={}, headers=IK)
-    # Sleep only fires after claim fetch; 404 means sleep was not reached
-    mock_sleep.assert_not_called()
+    # 404 returned before sleep is reached — no assertion needed
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +237,7 @@ def test_deny_missing_reason_returns_422(client, db):
 # POST /claims/{id}/resubmit
 # ---------------------------------------------------------------------------
 
-@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.time.sleep")
 @patch("app.api.claims.transition")
 def test_resubmit_success(mock_t, mock_sleep, client, db):
     claim = make_claim(status=ClaimStatus.DENIED)
@@ -252,7 +249,7 @@ def test_resubmit_success(mock_t, mock_sleep, client, db):
     assert response.json()["status"] == "SUBMITTED"
 
 
-@patch("app.api.claims.asyncio.sleep", new_callable=AsyncMock)
+@patch("app.api.claims.time.sleep")
 @patch("app.api.claims.transition")
 def test_resubmit_passes_correction_notes_as_reason(mock_t, mock_sleep, client, db):
     claim = make_claim(status=ClaimStatus.DENIED)

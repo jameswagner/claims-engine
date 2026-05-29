@@ -48,6 +48,20 @@ def transition(
             f"Cannot transition from {from_status.value} to {to_status.value}"
         )
 
+    if idempotency_key is not None:
+        if db.scalar(select(ClaimEvent).where(ClaimEvent.idempotency_key == idempotency_key)):
+            log.warning(
+                "transition_rejected",
+                claim_id=str(claim.id),
+                from_status=from_status.value,
+                to_status=to_status.value,
+                reason="duplicate_idempotency_key",
+                idempotency_key=idempotency_key,
+            )
+            raise DuplicateTransitionError(
+                f"Transition to {to_status.value} already recorded for claim {claim.id}"
+            )
+
     if from_status == ClaimStatus.CREATED and to_status == ClaimStatus.VALIDATED:
         result = validate_claim(
             ClaimInput(
@@ -69,20 +83,6 @@ def transition(
                 errors=result.errors,
             )
             raise ValidationFailedError(result.errors)
-
-    if idempotency_key is not None:
-        if db.scalar(select(ClaimEvent).where(ClaimEvent.idempotency_key == idempotency_key)):
-            log.warning(
-                "transition_rejected",
-                claim_id=str(claim.id),
-                from_status=from_status.value,
-                to_status=to_status.value,
-                reason="duplicate_idempotency_key",
-                idempotency_key=idempotency_key,
-            )
-            raise DuplicateTransitionError(
-                f"Transition to {to_status.value} already recorded for claim {claim.id}"
-            )
 
     event = ClaimEvent(
         claim_id=claim.id,
