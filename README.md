@@ -1,6 +1,6 @@
-# Claims Lifecycle Tracker
+# Grow Therapy Billing Ops Platform
 
-A healthcare insurance claims processing system that tracks the full lifecycle of a claim — from creation through validation, submission, adjudication, and payment or denial. Built to demonstrate the kind of stateful, rule-heavy, auditable backend work that exists in real behavioral health billing infrastructure: every transition is validated against a database-driven rules engine, every state change writes an immutable audit event, and duplicate submissions are rejected at both the application and database level.
+An internal billing operations platform for monitoring and processing insurance claims across a therapy network at scale. Users are ops staff tracking thousands of therapists' claims across dozens of payers — not individual clinicians submitting their own claims. Every transition is validated against a database-driven rules engine, every state change writes an immutable audit event, duplicate submissions are rejected at both the application and database level, and a Celery task queue handles asynchronous clearinghouse and remittance work.
 
 ---
 
@@ -82,13 +82,6 @@ cd backend
 .venv/bin/pytest tests/ -v
 ```
 
-**Run tests:**
-
-```bash
-cd backend
-.venv/bin/pytest tests/ -v
-```
-
 ---
 
 ## API
@@ -119,7 +112,7 @@ cd backend
 
 - **Pessimistic locking on transition endpoints.** All write-path fetches use `SELECT ... FOR UPDATE` to lock the claim row for the duration of the transaction. This closes the race where two concurrent callers both read the same `claim.status`, both pass the transition check, and both attempt to write — only one commit succeeds, the second hits a stale state and gets an `InvalidTransitionError`. The idempotency key's unique index provides a second layer: even if two workers with different keys both pass the state check, only one `INSERT INTO claim_events` succeeds. In production you'd more likely see queue partitioning by `claim_id` (so a single worker handles each claim serially) or application-level claim ownership with a `locked_by` field — the DB row lock is appropriate here because transitions are short-lived.
 
-- **Sync endpoints with `time.sleep` over async with sync SQLAlchemy.** The submit and resubmit routes simulate clearinghouse latency with a brief sleep. Making them `async def` while using a synchronous SQLAlchemy session would block the event loop during every DB call — negating the point of async. They're `def` instead, which FastAPI offloads to a thread pool so the sleep and DB calls block only that thread.
+- **Sync `def` handlers over `async def` with sync SQLAlchemy.** Route handlers that do blocking work (DB calls, sleep) are plain `def`, which FastAPI offloads to a thread pool. Making them `async def` while using a synchronous SQLAlchemy session would block the event loop during every DB call — negating the benefit of async. The actual async work (clearinghouse handshake, remittance processing) lives in Celery workers, which is the right place for it.
 
 - **`native_enum=False` for status columns.** SQLAlchemy stores `ClaimStatus` as `VARCHAR` rather than a PostgreSQL native `ENUM`. Native enums are slightly more compact and faster to compare, but adding a new status value requires `ALTER TYPE` which can lock the table. `VARCHAR` with an application-level check constraint makes migrations simpler — an `ALTER TABLE ADD COLUMN` or a new value in the Python enum is enough. For a financial ledger where the status enum changes rarely, either is defensible; the migration ergonomics tilted the choice here.
 

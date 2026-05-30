@@ -1,520 +1,143 @@
-# Claims Lifecycle Tracker — Project Report
+# Grow Therapy Billing Ops Platform — Technical Report
 
 ## What This Is
 
-A monorepo for a healthcare claims processing system. The goal is to track the full lifecycle of an insurance claim — from creation through validation, submission, adjudication, payment or denial — with a full audit trail of every status change.
+An internal billing operations platform modeled on the kind of system that handles claims processing at network scale — not a solo therapist tracker. Users are ops staff monitoring thousands of therapists' claims across dozens of payers. Every claim transition is validated against a database-driven rules engine, every state change writes an immutable audit event, duplicate submissions are rejected at both the application and database level, and a Celery task queue handles asynchronous clearinghouse and remittance work.
 
 ---
 
-## Repository Structure
+## Architecture
+
+Six Docker services:
+
+| Service | Image | Purpose |
+|---------|-------|---------|
+| `db` | postgres:16-alpine | Primary datastore |
+| `redis` | redis:7-alpine | Celery broker + result backend + replay state |
+| `backend` | ./backend | FastAPI API server (uvicorn) |
+| `worker` | ./backend | Celery worker — clearinghouse, remittance, generators |
+| `beat` | ./backend | Celery Beat — fires background generators every 30s |
+| `flower` | mher/flower:2.0 | Task monitoring UI at :5555 |
+
+**Claim lifecycle:**
 
 ```
-ClaimsProcessing/
-├── .env.example
-├── .gitignore
-├── docker-compose.yml
-├── backend/
-│   ├── Dockerfile
-│   ├── entrypoint.sh
-│   ├── requirements.txt
-│   ├── alembic.ini
-│   ├── alembic/
-│   │   ├── env.py
-│   │   └── versions/
-│   │       └── e4384232efa6_initial.py
-│   └── app/
-│       ├── main.py
-│       ├── api/
-│       │   └── health.py
-│       ├── db/
-│       │   └── session.py
-│       ├── models/
-│       │   ├── enums.py
-│       │   ├── claim.py
-│       │   └── claim_event.py
-│       ├── schemas/       ← empty, Pydantic schemas go here
-│       └── rules/         ← empty, business logic goes here
-└── frontend/
-    ├── Dockerfile
-    ├── index.html
-    ├── package.json
-    ├── tsconfig.json
-    ├── tsconfig.node.json
-    ├── vite.config.ts
-    └── src/
-        ├── main.tsx
-        ├── App.tsx
-        └── vite-env.d.ts
+CREATED → VALIDATED → SUBMITTING → SUBMITTED → ADJUDICATED → PAID
+                              └→ CLEARINGHOUSE_REJECTED      └→ DENIED → SUBMITTING (resubmit)
 ```
 
 ---
 
-## Infrastructure — `docker-compose.yml`
+## Backend Structure
 
-Three services:
-
-**db** — `postgres:16-alpine`. Runs with a named volume `pgdata` so data survives container restarts. Has a healthcheck using `pg_isready` that polls every 5 seconds. The `backend` service declares `depends_on: db: condition: service_healthy`, meaning Docker will not start the backend until Postgres passes the healthcheck. Credentials default to `claims/claims/claims` and can be overridden via `.env`.
-
-**backend** — Built from `./backend/Dockerfile`. Port 8000. Mounts `./backend:/app` as a volume so source changes are live without rebuilding. The `DATABASE_URL` in the container uses `db` as the hostname (the Docker service name), not `localhost`.
-
-**frontend** — Built from `./frontend/Dockerfile`. Port 5173. Has two volume mounts: `./frontend:/app` for live source, and `/app/node_modules` as an anonymous volume to prevent the host mount from wiping out the container's installed packages — a common Docker + Node gotcha.
+```
+backend/app/
+├── main.py              # app factory — middleware, router mounts, CORS
+├── core/logging.py      # structlog config (console dev / JSON prod)
+├── db/session.py        # engine, SessionLocal, Base, get_db()
+├── models/              # SQLAlchemy ORM models
+│   ├── claim.py
+│   ├── claim_event.py
+│   ├── remit.py / remit_code.py
+│   ├── payor_rule.py
+│   └── enums.py
+├── schemas/             # Pydantic request/response schemas
+├── api/                 # Route handlers
+│   ├── claims.py        # full lifecycle endpoints
+│   ├── remits.py        # EOB submission and retrieval
+│   ├── analytics.py     # aggregations from event ledger (in progress)
+│   └── demo.py          # replay trigger and status polling (in progress)
+├── claims/
+│   ├── state_machine.py # transition() — validates, locks, writes event
+│   └── exceptions.py
+├── rules/
+│   └── validator.py     # DB-driven rules engine
+└── tasks/               # Celery task modules
+    ├── generators.py    # session completion events → CREATED/VALIDATED claims
+    ├── submission.py    # clearinghouse EDI handshake, 80/20 success/reject
+    ├── remittance.py    # 835 batch processor, payer-specific denial rates
+    └── replay.py        # orchestrator: compresses 3 days into ~2 minutes
+```
 
 ---
 
-## Backend
-
-### `Dockerfile` + `entrypoint.sh`
-
-The image is `python:3.12-slim`. At build time it installs all Python dependencies from `requirements.txt`. At runtime it calls `sh entrypoint.sh`, which does two things in sequence:
-
-```sh
-#!/bin/sh
-set -e
-alembic upgrade head
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-The `exec` replaces the shell process with uvicorn so uvicorn becomes PID 1 and receives signals (like SIGTERM on `docker stop`) correctly. `set -e` means if the migration fails, the container exits immediately rather than starting a broken server.
-
-### `requirements.txt`
-
-| Package | Version | Purpose |
-|---|---|---|
-| fastapi | 0.115.12 | Web framework |
-| uvicorn[standard] | 0.34.3 | ASGI server |
-| sqlalchemy | 2.0.41 | ORM |
-| psycopg2-binary | 2.9.10 | PostgreSQL driver |
-| python-dotenv | 1.1.0 | `.env` loading |
-| alembic | 1.16.1 | Migrations |
-| structlog | 24.4.0 | Structured logging |
-
-All versions are pinned. `uvicorn[standard]` includes `websockets` and `httptools` for production-grade performance. `psycopg2-binary` bundles native libs so no C compiler is needed at build time. SQLAlchemy 2.0 is a major revision from 1.x with proper type annotation support via `Mapped`.
-
-### `app/main.py` — Entry Point
-
-`main.py` creates the app, configures logging and middleware, and mounts routers. No routes are defined here directly.
-
-```python
-configure_logging()   # reads LOG_LEVEL and ENVIRONMENT env vars
+## Key Technical Decisions
 
-@app.middleware("http")
-async def request_logging_middleware(request, call_next):
-    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
-    structlog.contextvars.clear_contextvars()
-    structlog.contextvars.bind_contextvars(request_id=request_id)
-    # logs request_started, calls handler, logs request_finished with duration_ms
-    response.headers["X-Request-ID"] = request_id
-    return response
-```
-
-`configure_logging()` is called at import time so logging is configured before any route handler runs. The middleware uses `structlog.contextvars` to bind `request_id` for the duration of the request — every log call downstream (validator, state machine) automatically includes it without being passed explicitly.
-
-### `app/db/session.py` — Database Layer
-
-Three exports used throughout the app:
-
-- **`engine`** — the SQLAlchemy connection pool, created once at module load from `DATABASE_URL`
-- **`SessionLocal`** — a factory that produces database sessions. `autocommit=False` means you have to explicitly commit; `autoflush=False` means SQLAlchemy won't automatically sync state before queries
-- **`Base`** — all SQLAlchemy models inherit from this. It holds `metadata`, which is what Alembic inspects to detect schema changes
-- **`get_db()`** — a FastAPI dependency. Routes declare `db: Session = Depends(get_db)` and get a session that is automatically closed when the request finishes, even if it raises an exception
-
-### `app/models/enums.py`
-
-```python
-class ClaimStatus(str, enum.Enum):
-    CREATED = "CREATED"
-    VALIDATED = "VALIDATED"
-    SUBMITTED = "SUBMITTED"
-    ADJUDICATED = "ADJUDICATED"
-    PAID = "PAID"
-    DENIED = "DENIED"
-```
-
-`ClaimStatus` inherits from both `str` and `enum.Enum`. The `str` base means instances serialize directly to their string value in JSON — no custom serializer needed. Kept in its own file to avoid circular imports between `claim.py` and `claim_event.py`, both of which need it.
-
-### `app/models/claim.py` — The Core Entity
+### State Machine + Pessimistic Locking
 
-```python
-class Claim(Base):
-    __tablename__ = "claims"
-    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    patient_name: Mapped[str] = mapped_column(String, nullable=False)
-    provider_name: Mapped[str] = mapped_column(String, nullable=False)
-    cpt_code: Mapped[str] = mapped_column(String, nullable=False)
-    diagnosis_code: Mapped[str] = mapped_column(String, nullable=False)
-    insurance_payer: Mapped[str] = mapped_column(String, nullable=False)
-    status: Mapped[ClaimStatus] = mapped_column(
-        Enum(ClaimStatus, name="claimstatus", native_enum=False), nullable=False, default=ClaimStatus.CREATED
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
-    events = relationship("ClaimEvent", back_populates="claim", cascade="all, delete-orphan")
-```
+All write-path claim fetches use `SELECT ... FOR UPDATE`. Two concurrent workers that both read the same `claim.status`, both pass the transition check, but only one commits — the second hits a stale row and gets an `InvalidTransitionError`. A second layer of protection: the idempotency key's unique index on `claim_events` means even if two workers with different keys both pass the state check, only one INSERT succeeds.
 
-Key decisions:
+### Idempotency
 
-- **UUID primary key** instead of integer — avoids leaking sequential IDs in the API, harder to enumerate records
-- **`native_enum=False`** — stores status as a VARCHAR with a check constraint rather than a PostgreSQL native ENUM type. Native enums in Postgres are harder to alter (adding a value requires a DDL statement that can lock the table and is difficult to roll back via Alembic)
-- **`cascade="all, delete-orphan"`** — deleting a Claim automatically deletes all its ClaimEvents at the ORM level
-- **`server_default=func.now()`** on timestamps — the default is set at the database level, not in Python, so it's accurate even if records are inserted bypassing the ORM
+Every transition endpoint requires an `Idempotency-Key` header — a UUID the caller generates per *operation*. The key is stored on `ClaimEvent` with a unique index. A retry with the same key replays the original 200 response. A different key for the same claim is a new operation, not a duplicate — so a claim can be denied and resubmitted without the check blocking the second submission. The idempotency check runs before the rules engine so retries bail immediately without re-hitting the DB. This is the Stripe pattern.
 
-### `app/models/claim_event.py` — The Audit Trail
+### Celery + Redis over FastAPI BackgroundTasks
 
-```python
-class ClaimEvent(Base):
-    __tablename__ = "claim_events"
-    id: Mapped[uuid.UUID] = ...
-    claim_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("claims.id", ondelete="CASCADE"), nullable=False
-    )
-    from_status: Mapped[ClaimStatus] = ...
-    to_status: Mapped[ClaimStatus] = ...
-    reason: Mapped[str | None] = mapped_column(String, nullable=True)
-    idempotency_key: Mapped[str | None] = mapped_column(String(255), nullable=True, unique=True, index=True)
-    triggered_at: Mapped[datetime] = ...
-```
+`BackgroundTasks` has no durability, no retry, no monitoring — a restart drops everything in flight. Celery adds retry logic, dead-letter queues, and Flower observability. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work — the caller gets an immediate response, the EDI handshake happens in the background. Flower at `:5555` gives an on-call engineer full visibility into what workers are doing.
 
-Every status change on a claim writes a ClaimEvent row capturing where it came from, where it went, and optionally why. `reason` is nullable because most transitions don't need explanation — denial does. `idempotency_key` stores the client-supplied key so duplicate submissions can be detected and replayed. The `ondelete="CASCADE"` on the foreign key ensures the database enforces deletion even on raw SQL bypassing the ORM.
+### Replay Architecture
 
-### Alembic — Migration System
+`POST /demo/replay` enqueues a Celery orchestrator that compresses 3 days of billing activity into ~2 minutes. Within each simulated day it fires session completion bursts, submission tasks, and remittance batches at realistic ratios. Progress is tracked in Redis (`demo:replay:status`) and polled by the frontend every 3 seconds for a live progress banner.
 
-`alembic/env.py` has two key customizations over the default:
+### Historical Seed vs Live Workers
 
-```python
-from app.db.session import Base
-import app.models  # ensures all models are registered with Base.metadata
+The seed script (`seed.py`) writes 300 historically resolved claims directly to the DB with Aetna denial rates at ~15% — unremarkable. The live remittance worker uses Aetna's real-world 35% denial rate on 90837. During a demo replay, the analytics charts update in real time as the Aetna bar climbs above the others. The anomaly emerges rather than being pre-baked.
 
-database_url = os.getenv("DATABASE_URL", "postgresql://claims:claims@localhost:5432/claims")
-config.set_main_option("sqlalchemy.url", database_url)
-```
+### Immutable Event Ledger
 
-Importing `app.models` is critical — Alembic uses `Base.metadata` to detect schema changes, and models only register themselves with `Base.metadata` when their module is imported. Without this import, autogenerate would see an empty schema and generate a migration that drops all your tables.
+Every status transition writes a `ClaimEvent` with `from_status`, `to_status`, `reason`, `idempotency_key`, and `triggered_at`. The events are never updated or deleted. The analytics endpoint (`GET /analytics/claims`) aggregates from the event ledger rather than the claims table — `avg_days_to_adjudication_by_payer` uses SUBMITTED→ADJUDICATED event pairs, aging counts use how long a claim has been in SUBMITTED state, throughput is counts of events in the last 24 hours.
 
-The generated migration (`e4384232efa6_initial.py`) creates both tables. `claimstatus` is stored as a VARCHAR enum (not a native PG ENUM), so the migration doesn't need to create a type before the table.
+### `native_enum=False` for Status Columns
 
----
+`ClaimStatus` is stored as VARCHAR rather than a PostgreSQL native ENUM. Adding a new status (`SUBMITTING`, `CLEARINGHOUSE_REJECTED`) requires no `ALTER TYPE` — just a Python enum value and an Alembic migration that updates the check constraint. Native ENUMs are harder to alter and can lock the table in older Postgres versions.
 
-## Frontend
+### Sync `def` for Submission Endpoints
 
-Vite + React + TypeScript + Tailwind CSS v4. Two pages, full API wiring.
+Submit and resubmit simulate clearinghouse latency with `time.sleep`. Making them `async def` while using a synchronous SQLAlchemy session would block the event loop during every DB call. FastAPI offloads sync `def` handlers to a thread pool automatically — the sleep and DB calls block only that thread, not the event loop.
 
-### Structure
+### Cursor-Based Pagination
 
-```
-src/
-├── api/claims.ts         # all fetch calls, error parsing
-├── types/claim.ts        # TypeScript types mirroring API schemas
-├── components/
-│   └── StatusBadge.tsx   # color-coded pill for each ClaimStatus
-├── pages/
-│   ├── ClaimsList.tsx    # card grid + "Create Test Claim" button
-│   └── ClaimDetail.tsx   # claim info, advance button, event timeline
-├── App.tsx               # BrowserRouter + Routes
-├── main.tsx              # React root mount
-└── index.css             # @import "tailwindcss"
-```
+`GET /claims` paginates using a cursor encoding `(created_at, id)` as base64 JSON. The WHERE clause uses `(created_at, id) < (cursor_created_at, cursor_id)` with stable ORDER BY. Cost is constant regardless of page depth — offset pagination degrades as page number grows because the DB must scan and discard all prior rows.
 
-### `src/api/claims.ts`
+### DB-Driven Rules Engine
 
-Single `request<T>()` helper that sets `Content-Type`, checks `res.ok`, and throws a typed `ApiError` on failure. All route functions (`fetchClaims`, `fetchClaim`, `createClaim`, `advanceClaim`) call through it. `parseApiError()` normalizes the two error shapes the backend returns — plain string `detail` vs `{ errors: string[] }` — into a single display string.
-
-### `src/components/StatusBadge.tsx`
-
-A `Record<ClaimStatus, string>` maps each status to Tailwind classes. Full class strings (not dynamic concatenation) so Tailwind's scanner picks them up:
-
-| Status | Color |
-|---|---|
-| CREATED | Gray |
-| VALIDATED | Blue |
-| SUBMITTED | Yellow |
-| ADJUDICATED | Purple |
-| PAID | Green |
-| DENIED | Red |
-
-### `src/pages/ClaimsList.tsx`
-
-Fetches all claims on mount. Renders a responsive card grid. "Create Test Claim" posts a hardcoded sample claim (CPT 90837, F32.1, Aetna) and navigates to the detail page. Cards are `<button>` elements for keyboard/accessibility.
-
-### `src/pages/ClaimDetail.tsx`
-
-Fetches claim by ID from `useParams`. Shows claim metadata in a definition list. "Advance Claim" button calls `POST /claims/{id}/advance`, updates local state with the response, and shows inline validation errors from the API. Button is disabled with a message when the claim is in a terminal state (PAID or DENIED). Event timeline renders each `ClaimEvent` as a vertical list with connecting lines and a `StatusBadge` on each transition.
-
----
-
-## Runtime State
-
-| Service | Status | URL |
-|---|---|---|
-| PostgreSQL 16 | Running | localhost:5432 |
-| FastAPI | Running | http://localhost:8000 |
-| React/Vite | Running | http://localhost:5173 |
-
-Tables confirmed in the database:
-- `alembic_version` — tracks current migration revision
-- `claims` — core entity table
-- `claim_events` — audit trail table
-
----
-
-## Structured Logging
-
-### `app/core/logging.py`
-
-Configures structlog once at startup. Reads `LOG_LEVEL` (default `INFO`) and `ENVIRONMENT` from env vars.
-
-- **Development** (`ENVIRONMENT != "production"`): `ConsoleRenderer` with colored output for human readability.
-- **Production**: `JSONRenderer` — one JSON object per log line, compatible with Datadog, CloudWatch, Loki, etc.
-
-Every log line includes: `timestamp` (ISO 8601), `level`, `service: "claims-backend"`, `request_id` (from contextvars).
-
-### `app/middleware` — Request Tracing
-
-The HTTP middleware generates or propagates a `request_id` (UUID4) per request:
-
-1. Checks `X-Request-ID` header first — upstream load balancers and API gateways often set this.
-2. Falls back to a freshly generated UUID4.
-3. Calls `structlog.contextvars.bind_contextvars(request_id=...)` so every log call for the rest of the request automatically carries it, without needing to pass it through function arguments.
-4. Echoes the `request_id` back in the response as `X-Request-ID` so clients can correlate errors with server logs.
-
-### Log Lines in Business Logic
-
-**State machine** — logs on every transition attempt:
-- `transition_applied` — claim_id, payer, from_status, to_status, duration_ms
-- `transition_rejected` — claim_id, from_status, to_status, reason (one of `invalid_transition`, `validation_failed`, `duplicate_transition`)
-
-**Validator** — logs after every `validate_claim()` call:
-- `claim_validated` — payer, cpt_code, is_valid, errors list, duration_ms
-
----
-
-## Interview Questions
-
-### Docker / Infrastructure
-
-**Q: Why does `depends_on` with a healthcheck matter here?**
-Without it, Docker starts the backend container as soon as the Postgres container *starts* — not when Postgres is actually ready to accept connections. The backend would crash on startup trying to connect to a Postgres that's still initializing. The healthcheck (`pg_isready`) makes Docker wait until the database is actually accepting connections.
-
-**Q: Why are there two volume mounts on the frontend container?**
-`./frontend:/app` gives the container live access to your source files. But it also overwrites `/app/node_modules` with your (empty) host directory, breaking all imports. The second mount `/app/node_modules` is an anonymous Docker volume that sits on top of the host mount specifically for that directory, preserving the packages installed during `docker build`.
-
-**Q: What does `exec` do in the entrypoint script and why does it matter?**
-`exec` replaces the shell process with uvicorn rather than spawning it as a child. Without `exec`, the shell is PID 1 and uvicorn is a child. When Docker sends SIGTERM to stop the container, the shell may not forward it to uvicorn, causing the container to hang until a SIGKILL timeout. With `exec`, uvicorn is PID 1 and receives the signal directly.
-
-### SQLAlchemy / Database
-
-**Q: What's the difference between `server_default` and `default` in SQLAlchemy?**
-`default` is applied by Python/SQLAlchemy before the INSERT — it generates the value in application code. `server_default` is a SQL expression sent as part of the column definition (e.g., `DEFAULT now()`) and applied by the database itself. `server_default` is more reliable because it works even on raw SQL inserts that bypass the ORM.
-
-**Q: Why use `native_enum=False` for `ClaimStatus`?**
-PostgreSQL native ENUMs are a DDL type — adding a new value requires `ALTER TYPE`. In Alembic, this is awkward to express and can't be cleanly rolled back. `native_enum=False` stores the value as VARCHAR with a check constraint. Adding a new status is then just adding it to the Python enum and running a migration that updates the check constraint, which is straightforward.
-
-**Q: Why is `app.models` imported in `alembic/env.py`?**
-SQLAlchemy models register themselves with `Base.metadata` only when their module is imported. Alembic autogenerate works by comparing `Base.metadata` (what your code says the schema should be) against the live database. If the models aren't imported, `metadata` is empty and autogenerate would produce a migration that drops all your tables.
-
-**Q: What is `get_db()` and why is it a generator?**
-It's a FastAPI dependency that yields a database session. Being a generator (using `yield`) allows code after the `yield` to run as cleanup after the request finishes — the `finally: db.close()` block runs whether the request succeeded or raised an exception. This guarantees sessions are always returned to the connection pool.
-
-**Q: Why use UUID primary keys instead of integers?**
-Integer keys are sequential and guessable — a user who sees `/claims/42` knows `/claims/43` probably exists and can try to access it. UUIDs are not enumerable. They also make it easier to merge data from multiple sources without key collisions, and to generate IDs client-side before hitting the database.
-
-### FastAPI
-
-**Q: Why are routes defined in separate files rather than in `main.py`?**
-Separation of concerns and scalability. `main.py` as an entry point that only mounts routers means you can add an entire new feature area (e.g., `app/api/claims.py`) with one line in `main.py`. It also makes testing easier — you can test a router in isolation without spinning up the full application.
-
-**Q: What does `ClaimStatus(str, enum.Enum)` give you over a plain `enum.Enum`?**
-The `str` mixin makes each enum member a real string subclass. FastAPI serializes it directly as a JSON string without a custom encoder. It also means you can compare `status == "DENIED"` without having to call `.value`. Without the `str` mixin, FastAPI would serialize it as `{"status": "DENIED"}` in some contexts and plain `"DENIED"` in others depending on how it's accessed.
-
----
-
-### Project Structure — FastAPI Backend
-
-**Q: What does a well-structured FastAPI project look like and why?**
-A mature FastAPI project separates concerns into distinct layers:
-
-```
-app/
-├── main.py          # app factory only — middleware, router mounts
-├── api/             # one file per feature: claims.py, users.py, etc.
-├── models/          # SQLAlchemy ORM models (database shape)
-├── schemas/         # Pydantic models (API request/response shape)
-├── db/              # session factory, Base, get_db dependency
-├── rules/           # pure business logic, no framework dependencies
-└── dependencies/    # shared FastAPI dependencies (auth, pagination)
-```
-
-The key insight is that `models/` and `schemas/` are intentionally separate. Your ORM model is what the database looks like. Your Pydantic schema is what the API looks like. They are rarely identical — you don't want to expose `created_at` on a create request, or expose a password hash on a response. Keeping them separate means you control exactly what enters and exits the API boundary.
-
-**Q: What goes in `schemas/` vs `models/`?**
-`models/` contains SQLAlchemy classes that map to database tables — they define columns, relationships, and constraints. `schemas/` contains Pydantic classes that define what the API accepts and returns. For a claim you'd typically have:
-- `ClaimCreate` — what the client sends to create one (no `id`, no `status`, no timestamps)
-- `ClaimRead` — what the API returns (everything including computed fields)
-- `ClaimUpdate` — what the client sends to update one (all fields optional)
-
-FastAPI uses the schema for validation, serialization, and generating the OpenAPI docs at `/docs`.
-
-**Q: What is a FastAPI dependency and when would you use one?**
-A dependency is a function declared with `Depends()` that FastAPI calls automatically before your route handler. `get_db()` is a dependency — the route declares it needs a database session and FastAPI provides one. Common uses: database sessions, current authenticated user, pagination parameters, permission checks. Dependencies can depend on other dependencies, forming a tree that FastAPI resolves before calling the handler.
-
-**Q: What's the difference between a router and the main app?**
-`APIRouter` is a mini-application that groups related routes. You define routes on it exactly like you would on `app`, but it has no middleware or lifecycle of its own. `app.include_router(claims_router, prefix="/claims", tags=["claims"])` mounts it, automatically prefixing all its routes and grouping them in `/docs`. The main app (`FastAPI()`) is only created once in `main.py`; everything else is a router.
-
----
-
-### Project Structure — React Frontend
-
-**Q: What does a well-structured React + TypeScript frontend look like?**
-A maintainable structure separates concerns by type and by feature:
-
-```
-src/
-├── main.tsx              # mounts React, wraps with providers
-├── App.tsx               # router definition only
-├── pages/                # one component per route: ClaimsList, ClaimDetail
-├── components/           # shared UI: Button, Badge, StatusPill
-├── hooks/                # custom hooks: useClaimsAPI, useClaimStatus
-├── api/                  # typed fetch functions for each endpoint
-├── types/                # TypeScript interfaces matching API schemas
-└── lib/                  # pure utilities: formatDate, formatCurrency
-```
-
-`pages/` are route-level components — they own data fetching and layout. `components/` are presentational and reusable — they receive props and render UI. The `api/` layer centralizes all `fetch` calls so if the API URL or auth header changes, it changes in one place.
-
-**Q: What is `vite-env.d.ts` doing?**
-It extends the global `ImportMeta` interface to tell TypeScript that `import.meta.env.VITE_API_URL` exists and is a string. Without it, TypeScript would error on any `import.meta.env` access because those are Vite-specific additions not in the standard TypeScript DOM types. Only variables prefixed with `VITE_` are exposed to the browser bundle — other env vars are stripped at build time.
-
-**Q: What is `tsconfig.node.json` for?**
-Vite has two runtime contexts: the browser bundle and the Node.js build tooling (`vite.config.ts` runs in Node, not the browser). They need different compiler settings — for example, `vite.config.ts` uses Node module resolution, not the browser bundler resolution. `tsconfig.node.json` applies only to `vite.config.ts`, while `tsconfig.json` applies to `src/`. The `references` field in `tsconfig.json` links them together so `tsc` knows about both.
-
-**Q: Why `react-router-dom` v7 specifically?**
-v7 is a full rewrite that merges React Router with Remix's data layer. It ships its own TypeScript types (no `@types/react-router-dom` needed). It introduces loader functions for route-level data fetching, replacing the pattern of fetching inside `useEffect` in a component. For this project it means claims data can load at the route level before the component renders, eliminating loading spinners for the initial page load.
-
----
-
-### Schema Decisions
-
-**Q: Why does `ClaimEvent` record `from_status` and `to_status` rather than just `to_status`?**
-Recording both sides makes the audit log self-contained. You can answer questions like "how many claims went directly from SUBMITTED to DENIED without being ADJUDICATED?" with a single query. If you only stored `to_status`, you'd have to reconstruct the previous state by looking at the prior event, which breaks if events are ever missing or out of order.
-
-**Q: Why is `reason` on `ClaimEvent` rather than on `Claim`?**
-`reason` is a property of a specific transition, not of the claim itself. A claim might be denied, then resubmitted, then paid — each transition can have its own reason. If `reason` were on `Claim`, you'd only have the most recent one and would lose the history of why it was denied the first time.
-
-**Q: Why are both `created_at` and `updated_at` on `Claim` but only `triggered_at` on `ClaimEvent`?**
-`ClaimEvent` rows are immutable — they're written once when a transition happens and never changed. So `updated_at` doesn't make sense on them. `triggered_at` is the single timestamp of when that specific event occurred. `Claim` has both because the claim itself is mutable — its status, and potentially other fields, can be updated after creation.
-
-**Q: Why use a client-supplied idempotency key instead of a server-computed one?**
-The original design used `MD5(claim_id + to_status)` as a server-computed key. This works for a strictly linear pipeline but breaks any workflow where a claim legitimately visits the same state more than once — deny → correct → resubmit → deny again is realistic in behavioral health billing. With a server-computed key, the second DENIED transition would collide with the first and be rejected as a duplicate. A client-supplied key (a UUID the caller generates per *operation*, not per *state*) separates "this is a retry of the same operation" from "this is a new operation that happens to target the same state." On a duplicate key, the server replays the original 200 response rather than returning 409 — the caller can't tell the difference, which is the point. This is the pattern Stripe uses for all payment mutations.
-
-**Q: What's missing from the schema that a production system would need?**
-Several things: an `amount` or `billed_amount` field on `Claim` for the dollar value, an `adjudicated_amount` for what the insurer agreed to pay, a `user_id` or `submitted_by` foreign key to track who created the claim, an index on `claims.status` for efficiently querying claims in a given state, and an index on `claim_events.claim_id` for efficiently fetching the event history of a specific claim.
-
----
+Validation rules live in `payor_rules` rather than in code. Each row has a `payer` (or `*` for all payers), a `rule_type` (`ALLOWED_CPT`, `EXCLUDED_CPT`, `REQUIRE_DIAGNOSIS_PREFIX`), and the relevant value. Adding a new payer exclusion is an INSERT, not a deployment. At scale this ruleset would be cached in Redis on startup to avoid a DB hit on every validation request.
 
 ### Structured Logging
 
-**Q: Why structlog over the standard library `logging` module?**
-The stdlib `logging` module is line-oriented — it produces human-readable strings that are hard to parse programmatically. `structlog` treats log events as dictionaries first, then renders them at the end of a processor chain. In development the chain ends with `ConsoleRenderer` for readability; in production it ends with `JSONRenderer` for machine ingestion. You get the same call site (`log.info("claim_validated", payer=..., is_valid=...)`) regardless of environment — the output format is purely a configuration concern.
-
-**Q: How does `request_id` propagate to the validator and state machine without being passed as a parameter?**
-Via `structlog.contextvars`. The middleware calls `structlog.contextvars.bind_contextvars(request_id=...)` at the start of every request. `merge_contextvars` is the first processor in the structlog chain, so it merges whatever is in the context into every log event dict before rendering. This is Python's `contextvars` module under the hood — context is per-async-task, so concurrent requests don't bleed into each other.
-
-**Q: Why check for `X-Request-ID` before generating one?**
-In a real deployment, the load balancer or API gateway upstream of the backend usually generates a request ID and passes it forward. Propagating that ID means a single request can be traced through the load balancer logs, the backend logs, and any downstream service logs using the same ID. Generating a new ID only when one isn't provided means the system works standalone (local dev, direct curl) without breaking tracing in the full stack.
-
-**Q: What's `cache_logger_on_first_use` and when would you turn it off?**
-It's a structlog optimization that freezes the processor chain on the first use of a given logger. Subsequent calls skip the chain-building step. The tradeoff is that if you call `structlog.configure()` after the first log call, the new config doesn't apply to cached loggers. For production this is always the right choice — configure once at startup, then cache. You'd turn it off in tests that need to reconfigure structlog between test cases.
-
-### Rules Engine
-
-**Q: What is a database-driven rules engine and why use one over hardcoded logic?**
-A DB-driven rules engine stores validation rules as rows in a table rather than `if` statements in code. Adding a new payer exclusion (e.g., "Cigna doesn't cover 90847") is an `INSERT`, not a code change and deployment. The `PayorRule` table has three rule types: `ALLOWED_CPT` (CPT must be in this set), `EXCLUDED_CPT` (this CPT is blocked for this payer), and `REQUIRE_DIAGNOSIS_PREFIX` (diagnosis must start with this string). A `payer` of `"*"` means the rule applies to all payers.
-
-**Q: How does the validator query rules efficiently?**
-It issues a single query filtering on `payer = claim.payer OR payer = "*"`. This pulls back both payer-specific and wildcard rules in one round trip. An index on `payor_rules.payer` makes this fast. The results are then partitioned in Python by `rule_type` to apply each category of check.
-
-**Q: Why does `EXCLUDED_CPT` use the rule's `description` field as the error message?**
-The description is written by whoever inserts the rule and carries human-readable context — "CPT 90853 (group therapy) is not covered by Medicare" is more useful to a user than a generic "code excluded." By surfacing the description directly, the validator avoids having to know anything about why a rule exists.
-
-**Q: How are the tests structured without a live database?**
-Using `unittest.mock.Mock` to fake the SQLAlchemy session. `make_db(*rules)` returns a Mock whose `.scalars(...).all()` returns whatever list of `PayorRule` instances you pass in. This means tests run in milliseconds, have no external dependencies, and can precisely control which rules the validator sees — impossible to do reliably with a real DB.
-
-**Q: Why normalize input fields at the start of `validate_claim` rather than at the API boundary?**
-The validator is the authoritative place for claim correctness — normalizing there means the rules always operate on clean data regardless of how the validator is called (HTTP, internal, tests). A leading space in a CPT code like `" 90837"` would silently fail an `ALLOWED_CPT` check without normalization, because the string comparison is exact. Normalizing all five fields with `.strip()` at the top of the function eliminates this class of silent failure. The API layer handles structural validation (Pydantic schema); the validator handles semantic/business-rule validation.
-
-**Q: What's the seed script for and how is it idempotent?**
-`seed_rules.py` populates the baseline ruleset on first run. It checks `db.query(PayorRule).count() == 0` before inserting, so running it twice doesn't duplicate rows. It's invoked manually via `docker exec ... python -m app.db.seed_rules`. A production system might replace this with a proper data migration in Alembic so seeding is automatic and versioned.
+Every request gets a UUID `request_id` generated at the middleware layer (or propagated from an upstream `X-Request-ID` header), bound via `structlog.contextvars` so every log line within that request carries it automatically. Development is pretty console output; `ENVIRONMENT=production` switches to JSON with `EventRenamer(to="message")` so the message key matches what Datadog and CloudWatch expect. Uvicorn's access log is suppressed to avoid duplicate request logging.
 
 ---
 
-### Next Steps
+## Database Schema (current)
 
-**Q: What would you build next on the backend?**
-The immediate next layer is:
-1. **Pydantic schemas** in `app/schemas/` — `ClaimCreate`, `ClaimRead`, `ClaimEventRead`
-2. **CRUD routes** in `app/api/claims.py` — `POST /claims`, `GET /claims`, `GET /claims/{id}`, `GET /claims/{id}/events`
-3. **Status transition endpoint** — `POST /claims/{id}/transition` with validation that the requested transition is legal (e.g., you can't go from PAID back to CREATED)
-4. **Transition rules** in `app/rules/` — a pure function that takes `(current_status, requested_status)` and returns whether it's allowed
+| Table | Purpose |
+|-------|---------|
+| `claims` | Core entity — status, financial fields, payer, provider, patient |
+| `claim_events` | Immutable audit trail — every transition with from/to status, reason, idempotency key |
+| `remits` | EOB record — raw 835 response, totals, idempotency key |
+| `remit_codes` | Adjustment codes from remit (CO-97, PR-1, etc.) with description and action_required |
+| `payor_rules` | DB-driven validation rules — payer, rule_type, CPT code/value |
 
-**Q: What would you build next on the frontend?**
-1. **API client** in `src/api/` — typed `fetchClaims()`, `fetchClaim(id)`, `createClaim()` functions using `VITE_API_URL`
-2. **Route structure** in `App.tsx` — `/claims` list view, `/claims/:id` detail view
-3. **ClaimsList page** — table of claims with status badges
-4. **ClaimDetail page** — claim fields plus timeline of ClaimEvents
-
-**Q: What would a status transition rule system look like?**
-A state machine — a dictionary mapping each status to the set of statuses it's allowed to transition to:
-
-```python
-ALLOWED_TRANSITIONS = {
-    ClaimStatus.CREATED:     {ClaimStatus.VALIDATED, ClaimStatus.DENIED},
-    ClaimStatus.VALIDATED:   {ClaimStatus.SUBMITTED, ClaimStatus.DENIED},
-    ClaimStatus.SUBMITTED:   {ClaimStatus.ADJUDICATED, ClaimStatus.DENIED},
-    ClaimStatus.ADJUDICATED: {ClaimStatus.PAID, ClaimStatus.DENIED},
-    ClaimStatus.PAID:        set(),
-    ClaimStatus.DENIED:      {ClaimStatus.SUBMITTED},  # allow resubmission
-}
-```
-
-A route calls `is_transition_allowed(current, requested)`, which looks up the set and returns a boolean. The `rules/` directory is the right home for this — it's pure logic with no database or framework dependencies, which makes it trivially testable.
+Financial fields on `Claim`: `billed_amount` (at creation), `allowed_amount` + `patient_responsibility` (at adjudication), `paid_amount` (at payment or remit). All `Numeric(10,2)` — no float rounding.
 
 ---
 
-## Current State (May 2026)
+## Build Status
 
-The project has evolved significantly from the early scaffolding described above. It is now a full billing operations platform targeting Grow Therapy's internal ops staff — not a solo therapist tracker.
-
-### What's built
-
-**Backend — fully working:**
-- Complete claims lifecycle API with explicit transition endpoints (`/validate`, `/submit`, `/adjudicate`, `/pay`, `/deny`, `/resubmit`)
-- State machine with `SELECT FOR UPDATE` pessimistic locking on all write-path fetches
-- Idempotency check (client-supplied UUID header) stored on every `ClaimEvent`, runs before the rules engine
-- Remit (EOB) processing — raw 835 response, adjustment code library (CO-97, CO-45, PR-1, etc.), financial field sync on claim
-- Structured logging with `structlog`, per-request UUID via middleware, JSON output in production
-- Celery + Redis task queue with Beat scheduler (session generators, clearinghouse submission worker, remittance batch processor)
-- Replay endpoint (`POST /demo/replay`) compresses 3 days of billing activity into ~2 minutes; progress in Redis
-
-**Data:**
-- Historical seed: 300 resolved claims, 6 months of backstory, Aetna denial rate intentionally unremarkable (~15%) as baseline
-- Live remittance worker drives Aetna 90837 to 35% during replay — the spike emerges in real time
-- Payer patterns: UHC adjudicates in 35-55 days (vs 15-25 for others), BCBS lowest denial rate (~8%)
-
-**Infrastructure:**
-- Docker Compose: 6 services (db, redis, backend, worker, beat, flower)
-- Flower task monitor at `:5555`
-- 8 Alembic migrations through remit idempotency key
-
-**In progress (Phase 2–4):**
-- SUBMITTING and CLEARINGHOUSE_REJECTED states + migration
-- Analytics endpoint (`GET /analytics/claims`) from event ledger
-- Cursor-based pagination on `GET /claims`
-- Dashboard with replay banner, denial-rate-by-payer charts (Recharts), aging alerts
-- Worklist with tabs (All / Exceptions / Aging), filters, request tracer badge
-
-### Architecture decisions (additions since initial build)
-
-**Sync `def` over `async def` for submission endpoints.** Submit and resubmit simulate clearinghouse latency with `time.sleep`. Making them `async def` while using a synchronous SQLAlchemy session would block the event loop during every DB call. They use `def` instead, which FastAPI offloads to a thread pool. With Celery workers handling the real async work, there's no benefit to async at the API boundary here.
-
-**`native_enum=False` for status columns.** `VARCHAR` with an application-level check rather than a PostgreSQL native ENUM. Adding a new status value (`SUBMITTING`, `CLEARINGHOUSE_REJECTED`) requires no `ALTER TYPE` — just an Alembic `op.execute("UPDATE...")` style migration. For a financial ledger where status values change infrequently, the migration ergonomics tilted the choice.
-
-**Celery + Redis over FastAPI BackgroundTasks.** BackgroundTasks have no durability, no retry, no monitoring — a restart drops everything in flight. Celery adds retry logic, dead-letter queues, and Flower observability. The operational difference matters at scale: an on-call engineer can see what the system is doing in Flower at 2am. The complexity cost is small — one `celery_app.py`, three task modules, four additional Docker services.
+| Component | Status |
+|-----------|--------|
+| Claims lifecycle API (all transitions) | ✅ Complete |
+| State machine + pessimistic locking | ✅ Complete |
+| Idempotency on all transitions + remit | ✅ Complete |
+| Rules engine (DB-driven) | ✅ Complete |
+| Remit (EOB) processing | ✅ Complete |
+| Structured logging + request tracing | ✅ Complete |
+| Celery + Redis + Flower infrastructure | ✅ Complete |
+| Historical seed (300 claims, 6 months) | ✅ Complete |
+| Task modules (generators, submission, remittance) | In progress |
+| Replay mode (demo endpoint) | In progress |
+| Analytics endpoint | In progress |
+| Cursor pagination + filtering on GET /claims | In progress |
+| Dashboard (replay banner, charts, metrics) | In progress |
+| Worklist (tabs, filters, request badge) | In progress |
