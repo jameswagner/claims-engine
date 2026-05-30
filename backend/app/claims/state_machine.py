@@ -15,12 +15,14 @@ from app.models.enums import ClaimStatus
 from app.rules.validator import ClaimInput, validate_claim
 
 ALLOWED_TRANSITIONS: dict[ClaimStatus, frozenset[ClaimStatus]] = {
-    ClaimStatus.CREATED:     frozenset({ClaimStatus.VALIDATED}),
-    ClaimStatus.VALIDATED:   frozenset({ClaimStatus.SUBMITTED}),
-    ClaimStatus.SUBMITTED:   frozenset({ClaimStatus.ADJUDICATED}),
-    ClaimStatus.ADJUDICATED: frozenset({ClaimStatus.PAID, ClaimStatus.DENIED}),
-    ClaimStatus.PAID:        frozenset(),
-    ClaimStatus.DENIED:      frozenset({ClaimStatus.SUBMITTED}),
+    ClaimStatus.CREATED:                frozenset({ClaimStatus.VALIDATED}),
+    ClaimStatus.VALIDATED:              frozenset({ClaimStatus.SUBMITTED, ClaimStatus.SUBMITTING}),
+    ClaimStatus.SUBMITTING:             frozenset({ClaimStatus.SUBMITTED, ClaimStatus.CLEARINGHOUSE_REJECTED}),
+    ClaimStatus.SUBMITTED:              frozenset({ClaimStatus.ADJUDICATED}),
+    ClaimStatus.CLEARINGHOUSE_REJECTED: frozenset({ClaimStatus.SUBMITTING}),
+    ClaimStatus.ADJUDICATED:            frozenset({ClaimStatus.PAID, ClaimStatus.DENIED}),
+    ClaimStatus.PAID:                   frozenset(),
+    ClaimStatus.DENIED:                 frozenset({ClaimStatus.SUBMITTED, ClaimStatus.SUBMITTING}),
 }
 
 log = structlog.get_logger()
