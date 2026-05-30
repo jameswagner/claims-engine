@@ -1,4 +1,3 @@
-import time
 import uuid
 from decimal import Decimal
 from typing import Annotated
@@ -99,18 +98,20 @@ def validate_claim_route(
     return claim
 
 
-@router.post("/{claim_id}/submit", response_model=ClaimDetail)
+@router.post("/{claim_id}/submit", response_model=ClaimDetail, status_code=202)
 def submit_claim(
     claim_id: uuid.UUID,
     body: SubmitRequest,
     idempotency_key: Annotated[str, Header()],
     db: Session = Depends(get_db),
 ):
+    from app.tasks.submission import process_submission
+
     claim = _fetch(claim_id, db, lock=True)
-    time.sleep(0.2)  # simulate clearinghouse round-trip
-    _transition(claim, ClaimStatus.SUBMITTED, db, idempotency_key, reason=body.clearinghouse_ref)
+    _transition(claim, ClaimStatus.SUBMITTING, db, idempotency_key, reason=body.clearinghouse_ref)
     db.commit()
     db.refresh(claim)
+    process_submission.delay(str(claim_id), str(uuid.uuid4()))
     return claim
 
 
@@ -163,16 +164,18 @@ def deny_claim(
     return claim
 
 
-@router.post("/{claim_id}/resubmit", response_model=ClaimDetail)
+@router.post("/{claim_id}/resubmit", response_model=ClaimDetail, status_code=202)
 def resubmit_claim(
     claim_id: uuid.UUID,
     body: ResubmitRequest,
     idempotency_key: Annotated[str, Header()],
     db: Session = Depends(get_db),
 ):
+    from app.tasks.submission import process_submission
+
     claim = _fetch(claim_id, db, lock=True)
-    time.sleep(0.2)  # simulate clearinghouse round-trip
-    _transition(claim, ClaimStatus.SUBMITTED, db, idempotency_key, reason=body.correction_notes)
+    _transition(claim, ClaimStatus.SUBMITTING, db, idempotency_key, reason=body.correction_notes)
     db.commit()
     db.refresh(claim)
+    process_submission.delay(str(claim_id), str(uuid.uuid4()))
     return claim

@@ -12,6 +12,7 @@ celery = Celery(
         "app.tasks.generators",
         "app.tasks.submission",
         "app.tasks.remittance",
+        "app.tasks.replay",
     ],
 )
 

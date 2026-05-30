@@ -6,7 +6,9 @@ import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.analytics import router as analytics_router
 from app.api.claims import router as claims_router
+from app.api.demo import router as demo_router
 from app.api.health import router as health_router
 from app.api.remits import router as remits_router
 from app.core.logging import configure_logging
@@ -24,6 +26,7 @@ app.add_middleware(
     allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
 
 
@@ -55,3 +58,5 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
 app.include_router(health_router)
 app.include_router(claims_router)
 app.include_router(remits_router)
+app.include_router(analytics_router)
+app.include_router(demo_router)
