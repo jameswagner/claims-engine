@@ -476,3 +476,45 @@ ALLOWED_TRANSITIONS = {
 ```
 
 A route calls `is_transition_allowed(current, requested)`, which looks up the set and returns a boolean. The `rules/` directory is the right home for this — it's pure logic with no database or framework dependencies, which makes it trivially testable.
+
+---
+
+## Current State (May 2026)
+
+The project has evolved significantly from the early scaffolding described above. It is now a full billing operations platform targeting Grow Therapy's internal ops staff — not a solo therapist tracker.
+
+### What's built
+
+**Backend — fully working:**
+- Complete claims lifecycle API with explicit transition endpoints (`/validate`, `/submit`, `/adjudicate`, `/pay`, `/deny`, `/resubmit`)
+- State machine with `SELECT FOR UPDATE` pessimistic locking on all write-path fetches
+- Idempotency check (client-supplied UUID header) stored on every `ClaimEvent`, runs before the rules engine
+- Remit (EOB) processing — raw 835 response, adjustment code library (CO-97, CO-45, PR-1, etc.), financial field sync on claim
+- Structured logging with `structlog`, per-request UUID via middleware, JSON output in production
+- Celery + Redis task queue with Beat scheduler (session generators, clearinghouse submission worker, remittance batch processor)
+- Replay endpoint (`POST /demo/replay`) compresses 3 days of billing activity into ~2 minutes; progress in Redis
+
+**Data:**
+- Historical seed: 300 resolved claims, 6 months of backstory, Aetna denial rate intentionally unremarkable (~15%) as baseline
+- Live remittance worker drives Aetna 90837 to 35% during replay — the spike emerges in real time
+- Payer patterns: UHC adjudicates in 35-55 days (vs 15-25 for others), BCBS lowest denial rate (~8%)
+
+**Infrastructure:**
+- Docker Compose: 6 services (db, redis, backend, worker, beat, flower)
+- Flower task monitor at `:5555`
+- 8 Alembic migrations through remit idempotency key
+
+**In progress (Phase 2–4):**
+- SUBMITTING and CLEARINGHOUSE_REJECTED states + migration
+- Analytics endpoint (`GET /analytics/claims`) from event ledger
+- Cursor-based pagination on `GET /claims`
+- Dashboard with replay banner, denial-rate-by-payer charts (Recharts), aging alerts
+- Worklist with tabs (All / Exceptions / Aging), filters, request tracer badge
+
+### Architecture decisions (additions since initial build)
+
+**Sync `def` over `async def` for submission endpoints.** Submit and resubmit simulate clearinghouse latency with `time.sleep`. Making them `async def` while using a synchronous SQLAlchemy session would block the event loop during every DB call. They use `def` instead, which FastAPI offloads to a thread pool. With Celery workers handling the real async work, there's no benefit to async at the API boundary here.
+
+**`native_enum=False` for status columns.** `VARCHAR` with an application-level check rather than a PostgreSQL native ENUM. Adding a new status value (`SUBMITTING`, `CLEARINGHOUSE_REJECTED`) requires no `ALTER TYPE` — just an Alembic `op.execute("UPDATE...")` style migration. For a financial ledger where status values change infrequently, the migration ergonomics tilted the choice.
+
+**Celery + Redis over FastAPI BackgroundTasks.** BackgroundTasks have no durability, no retry, no monitoring — a restart drops everything in flight. Celery adds retry logic, dead-letter queues, and Flower observability. The operational difference matters at scale: an on-call engineer can see what the system is doing in Flower at 2am. The complexity cost is small — one `celery_app.py`, three task modules, four additional Docker services.

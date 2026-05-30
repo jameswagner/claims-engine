@@ -1,178 +1,174 @@
-# LOOM SCRIPT — Claims Lifecycle Tracker
+# LOOM SCRIPT — Grow Therapy Billing Ops Platform
 _Update this after each build prompt._
+
+**Target runtime: ~5 minutes**
+**Framing: Grow Therapy's internal billing operations platform, not a solo tracker**
+
+---
+
+## BEFORE YOU HIT RECORD
+
+1. `docker compose up` — all 6 services healthy (db, redis, backend, worker, beat, flower)
+2. Run seed: `docker exec -w /app claimsprocessing-backend-1 python seed.py`
+3. Open tabs: `localhost:5173` (dashboard), `localhost:5555` (Flower), `localhost:8000/docs` (API)
+4. Dashboard should show ~300 historical claims, charts populated, all Aetna denial rates ~15%
 
 ---
 
 ## COLD OPEN (15 seconds)
-> "Most backend portfolio projects are search APIs or todo apps.
-> This is a healthcare insurance claims lifecycle tracker —
-> the kind of system that determines whether a therapist
-> actually gets paid. Let me show you how it works."
 
-**STATUS: Ready to record.**
+> "This is Grow Therapy's internal billing operations platform. Every time a therapist
+> completes a session, a claim enters this pipeline. I'm going to start by kicking off
+> a simulation that compresses 3 days of billing activity into about 2 minutes — and
+> then walk through what's actually happening while it runs."
 
----
-
-## SEGMENT 1 — THE PROBLEM (30 seconds)
-> "Insurance claims are stateful, rule-heavy financial
-> transactions. A claim moves through states — created,
-> validated, submitted, adjudicated, paid or denied.
-> Every transition needs to be auditable, every rule
-> needs to be inspectable, and nothing can ever be
-> submitted twice."
-
-**Show:** Repo structure in VS Code, `docker compose up` spinning up all three services.
-
-**STATUS: Ready to record.** Repo structure, models, and Docker Compose are all in place.
+**Action:** Click "Start Replay" button on dashboard → amber progress banner appears.
+Banner reads: "Replaying billing activity — Day 1 of 3 · 0 claims · 0 events processed"
 
 ---
 
-## SEGMENT 2 — THE RULES ENGINE + STATE MACHINE (90 seconds)
-> "Before a claim can move from created to validated it
-> runs through a rules engine. The rules aren't hardcoded
-> — they live in Postgres as data. Adding a new payor
-> rule is an INSERT, not a deployment."
+## SEGMENT 1 — THE QUEUE ARCHITECTURE (60 seconds)
 
-**Show:**
-- `payor_rules` table in DB — `SELECT payer, rule_type, cpt_code, value FROM payor_rules;`
-- POST a valid claim → advances to VALIDATED
-- POST a Medicare claim with CPT 90853 → rejected, error message returned
+> "The backend is FastAPI with a Celery task queue backed by Redis. Three worker types:
+> session completion generators that create claims as therapists finish appointments,
+> a clearinghouse submission worker that hands claims to the EDI network, and a
+> remittance batch processor that handles 835 files as payers adjudicate claims.
+>
+> In a real Grow Therapy system these workers consume events from session completion
+> webhooks from the EHR, 835 file drops from the clearinghouse, and payer API polling.
+> The queue decouples receiving an event from processing it — the API acknowledges
+> immediately, the actual work happens in the background."
 
-> "At scale you'd cache this ruleset in Redis on startup
-> to avoid a DB hit on every validation. And for
-> operational toggles — like temporarily suspending
-> Medicare submissions — you'd layer in something like
-> AWS AppConfig so ops teams can flip a switch without
-> touching the database."
+**Show:** Flower at `localhost:5555`
+- Connected workers, active tasks
+- Task history — submission and remittance tasks firing
+- Throughput chart ticking up
 
-**STATUS: Ready to record.**
-- ✅ `payor_rules` table seeded — show the DB query
-- ✅ Rules engine + state machine fully wired to HTTP endpoints
-- ✅ 69 passing unit tests (33 validator + 36 state machine)
-- ✅ `POST /claims` + `POST /claims/{id}/advance` — demo via UI or curl
+> "This is Flower — the Celery monitoring UI. An on-call engineer watching this at
+> 2am can see exactly what the workers are doing, which tasks are failing, and why.
+> That observability matters when you have 22,000 clinicians submitting claims."
 
----
-
-## SEGMENT 3 — IDEMPOTENCY (45 seconds)
-> "Double submissions are a real problem in claims —
-> network retries, user double-clicks, upstream system
-> bugs. The frontend generates a UUID for every advance
-> call and sends it as an Idempotency-Key header.
-> The backend stores it on the ClaimEvent and detects
-> duplicates on that key — not on a server-computed hash.
-> That distinction matters: a server hash of claim_id
-> plus status would silently block a second denial on
-> the same claim. The client-supplied key separates
-> retry from re-submission. This is the Stripe pattern."
-
-**Show:**
-- `idempotency_key` column in `claim_events`
-- Show the unique index on `claim_events.idempotency_key` in the DB
-- Hit "Advance Claim" twice rapidly — second call gets the same 200 response (replay, not 409)
-
-**STATUS: Ready to record.** `idempotency_key` stored on every `ClaimEvent`, unique constraint enforced at DB level, duplicate key replays 200 response.
+**Watch banner:** "Day 1 of 3 · 47 claims · 132 events processed"
 
 ---
 
-## SEGMENT 4 — THE AUDIT TRAIL + FINANCIALS (45 seconds)
-> "Every state transition writes an immutable event —
-> not just an updated_at timestamp but a full record
-> of where it came from, where it went, and why.
-> This is the foundation of any financial system."
+## SEGMENT 2 — RULES ENGINE + STATE MACHINE (60 seconds)
 
-**Show:**
-- Event timeline on the claim detail page — CREATED→VALIDATED→SUBMITTED→ADJUDICATED→PAID
-- Financial section on the claim card: Billed $200, Allowed $150, Patient Resp. $20, Paid $130
-- Thomas Chen (DENIED) — adjustment_reason "CO-97: procedure bundled" visible on the card
+> "Before a claim can move from CREATED to VALIDATED it runs through a rules engine.
+> The rules aren't hardcoded — they live in Postgres as data. Adding a new payer
+> exclusion is an INSERT, not a deployment."
 
-**STATUS: Ready to record.** Financial fields set at adjudication, `paid_amount` auto-computed on PAID, all visible in the UI.
+**Show:** `payor_rules` table via Swagger UI or quick SQL in the DB
 
----
+> "The state machine enforces valid transitions. VALIDATED can go to SUBMITTED, not
+> directly to PAID. Every transition writes an immutable ClaimEvent — not an
+> updated_at timestamp, a full record of where it came from, where it went, why,
+> and when. That event log answers questions a single status column never can:
+> how many claims went SUBMITTED directly to DENIED this month? What was the
+> denial reason on this claim six months ago?"
 
-## SEGMENT 5 — THE FRONTEND (30 seconds)
-> "The UI is deliberately simple — color coded status
-> badges, a timeline of events, one button to advance
-> the claim. The interesting engineering is in the
-> backend. But a hiring manager should be able to
-> click through it without a terminal."
+**Show:** ClaimDetail page — event timeline with from/to status and triggered_at timestamps
 
-**Show:**
-- Claims list at `http://localhost:5173` — cards with color-coded status badges
-- Hit "Create Test Claim" — lands on the detail page at CREATED
-- Hit "Advance Claim" four times — watch status badges flip through the pipeline
-- Show the event timeline filling in with each transition
-
-**STATUS: Ready to record.** React + TypeScript + Tailwind. Two pages, full API wiring, live status updates.
+> "All write-path endpoints use SELECT FOR UPDATE — pessimistic locking. If two
+> workers race to transition the same claim, only one commit succeeds."
 
 ---
 
-## SEGMENT 5b — REMIT PROCESSING (30 seconds)
-> "Once a claim is adjudicated, the payer sends back
-> an Explanation of Benefits — a remit. Each remit
-> contains adjustment codes: CO-97 means the procedure
-> was bundled, PR-1 is patient deductible, OA-23 is
-> a coordination of benefits adjustment. We store the
-> raw remit, parse each code against a library that
-> maps it to a human-readable action — 'bill patient',
-> 'resubmit unbundled' — and update the claim's
-> financial fields from the remit totals."
+## SEGMENT 3 — IDEMPOTENCY (30 seconds)
 
-**Show:**
-- `POST /claims/{id}/remit` via curl or Swagger UI — submit a remit with CO-45 and PR-1 codes
-- `GET /claims/{id}/remit` — show the response with codes, descriptions, action_required
+> "Every transition requires an Idempotency-Key header — a UUID the caller generates.
+> The key is stored on the ClaimEvent with a unique index. A retry with the same key
+> replays the original response. A different key for the same claim-plus-status is a
+> fresh attempt, not a duplicate — so a claim can be denied and resubmitted without
+> the idempotency check blocking the second submission.
+>
+> The check runs before the rules engine so retries bail immediately without
+> re-hitting the database."
 
-**STATUS: Ready to record.** Remit model, RemitCode model, code library, and API endpoints all in place.
+**Show:** The idempotency_key column on a ClaimEvent in the timeline (first 8 chars monospace)
 
 ---
 
-## SEGMENT 6 — OBSERVABILITY + SCALE (45 seconds)
-> "Before I talk about what I'd add at scale —
-> the observability is already wired. Every request
-> gets a UUID request_id. Every state transition
-> logs claim_id, payer, from_status, to_status,
-> duration in milliseconds. In development it's
-> pretty console output; flip ENVIRONMENT=production
-> and it's JSON — one line per event, ready for
-> Datadog or CloudWatch."
+## SEGMENT 4 — THE AETNA PATTERN (45 seconds)
 
-**Show:**
-- `docker compose logs backend` while clicking "Advance Claim" in the UI — show the structured log lines with request_id threading through validation and transition
-- README engineering decisions section
+> "The dashboard is pulling aggregations from the claim event ledger, not the
+> claims table. Let's look at the denial rate by payer chart."
 
-> "At Grow's scale — 10 million sessions, 22,000
-> clinicians — I'd layer in async claim submission
-> via a queue so the backend acknowledges immediately
-> and processes in the background, OpenTelemetry
-> spans to stitch together the full trace across
-> services, and a denial classification service
-> that turns CO-97 and PR-1 remit codes into
-> structured action items for billing teams."
+**Show:** Dashboard BarChart — currently all payers near 12-15%, Aetna unremarkable
 
-**STATUS: Ready to record.** Structured logging live — `request_id`, `transition_applied`, `claim_validated` log events visible in Docker logs.
+> "Historically, Aetna's denial rate on 90837 is about 15% — nothing alarming.
+> But the remittance batch worker I started at the beginning of this recording has
+> been adjudicating live claims at Aetna's real-world rate for 90837."
+
+**Show:** Watch Aetna's bar climb as replay continues — now showing 25-30%
+
+> "That's not pre-baked into the historical data. The workers introduced it. By
+> the time the replay finishes, you'll see Aetna's 90837 denial rate sitting at
+> 35% — roughly where it sits in the real behavioral health billing market. The
+> analytics surface the pattern automatically. A billing manager looking at this
+> dashboard would know to investigate Aetna 90837 claims."
+
+---
+
+## SEGMENT 5 — WORKLIST + PAGINATION (45 seconds)
+
+> "The worklist is built for billing ops, not developers."
+
+**Show:** Navigate to `/claims` — worklist page
+
+> "Three tabs: all claims, the exceptions queue — denied claims needing action —
+> and an aging queue for submissions past the 30-day SLA."
+
+**Show:** Click "Exceptions" tab — denied claims filtered automatically
+
+> "Cursor-based pagination. Watch the request badge."
+
+**Show:** Hit Next — bottom right shows "↩ 11ms · req-a3f2b1c4"
+
+> "That 11ms is constant regardless of how deep you are in the result set. Offset
+> pagination degrades as you page deeper — cursor pagination doesn't. The cursor
+> encodes a (created_at, id) pair as base64 so it's stable even as new claims
+> arrive between page loads."
+
+---
+
+## SEGMENT 6 — OBSERVABILITY + SCALE (30 seconds)
+
+> "Every request gets a UUID request_id generated at the middleware layer — or
+> propagated from an upstream X-Request-ID header. It's bound via structlog
+> contextvars so every log line within that request carries it automatically.
+> Development is pretty console output; ENVIRONMENT=production switches to JSON,
+> one line per event, ready for Datadog."
+
+**Show:** `docker compose logs worker` — structured log lines from the remittance processor
+
+> "What I'd add at production scale: async claim submission via Kafka so the backend
+> acknowledges receipt immediately, OpenTelemetry tracing to stitch together the full
+> lifecycle across services, a denial classification service that turns CO-97 and PR-1
+> codes into structured action items for billing teams, and per-payer circuit breakers
+> to handle payer API instability without cascading failures."
 
 ---
 
 ## COLD CLOSE (10 seconds)
-> "Code is on GitHub, live demo at [URL].
-> Happy to walk through any of it."
 
-**STATUS: Ready once repo is public and demo is deployed.**
+> "Code on GitHub. Happy to walk through any of it."
 
 ---
 
-## TOTAL TARGET: ~4 minutes
+## TOTAL TARGET: ~5 minutes
 
 ---
 
-## Build Progress Tracker
+## Build Status
 
-| Segment | Blocker |
-|---|---|
-| Cold open | — |
-| Segment 1 — Problem | — |
-| Segment 2 — Rules engine | Claims API endpoints (`POST /claims`, `POST /claims/{id}/transition`) |
-| Segment 3 — Idempotency | Idempotency key on submission + duplicate detection |
-| Segment 4 — Audit trail | Claims API + `GET /claims/{id}/events` |
-| Segment 5 — Frontend | Claims list page, detail page, status transition UI |
-| Segment 6 — Scale | — |
-| Cold close | Public GitHub + deployed demo |
+| Segment | Status |
+|---------|--------|
+| Cold open + replay trigger | Pending Phase 2 (replay endpoint) |
+| Flower / queue architecture | Pending Phase 1 complete + docker build |
+| Rules engine + state machine | ✅ Ready |
+| Idempotency | ✅ Ready |
+| Aetna pattern / analytics charts | Pending Phase 3 (analytics endpoint + dashboard) |
+| Worklist + pagination | Pending Phase 4 |
+| Observability | ✅ Ready |
+| Cold close | Pending public repo |

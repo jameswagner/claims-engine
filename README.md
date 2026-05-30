@@ -7,26 +7,38 @@ A healthcare insurance claims processing system that tracks the full lifecycle o
 ## Architecture
 
 ```
-┌──────────────────┐         ┌───────────────────────────────┐         ┌─────────────────┐
-│                  │         │  FastAPI  :8000                │         │                 │
-│  React + Vite    │ ──────▶ │                               │ ──────▶ │   PostgreSQL     │
-│  :5173           │         │  ┌─────────────┐              │         │   :5432         │
-│                  │         │  │ State       │              │         │                 │
-│  /               │         │  │ Machine     │              │         │  claims         │
-│  /claims/:id     │         │  └──────┬──────┘              │         │  claim_events   │
-│                  │         │         │                      │         │  payor_rules    │
-└──────────────────┘         │  ┌──────▼──────┐              │         │                 │
-                             │  │ Rules       │              │         └─────────────────┘
-                             │  │ Engine      │              │
-                             │  └─────────────┘              │
-                             └───────────────────────────────┘
+┌──────────────────┐    ┌────────────────────────────────────────────┐    ┌─────────────────┐
+│                  │    │  FastAPI  :8000                             │    │                 │
+│  React + Vite    │───▶│  State Machine · Rules Engine              │───▶│   PostgreSQL     │
+│  :5173           │    │  Analytics · Cursor Pagination              │    │   :5432         │
+│                  │    └──────────────────────┬─────────────────────┘    │                 │
+│  /               │                           │ enqueue                   │  claims         │
+│  /claims         │    ┌──────────────────────▼─────────────────────┐    │  claim_events   │
+│  /claims/:id     │    │  Redis  :6379                               │    │  payor_rules    │
+│                  │    └──────────────────────┬─────────────────────┘    │  remits         │
+└──────────────────┘                           │                           └─────────────────┘
+                         ┌─────────────────────▼──────────────────────┐
+                         │  Celery Workers                             │
+                         │  ┌──────────────┐  ┌──────────────────┐   │
+                         │  │  generators  │  │  submission      │   │
+                         │  │  (CREATED→   │  │  (clearinghouse  │   │
+                         │  │   VALIDATED) │  │   EDI handshake) │   │
+                         │  └──────────────┘  └──────────────────┘   │
+                         │  ┌──────────────┐  ┌──────────────────┐   │
+                         │  │  remittance  │  │  Beat scheduler  │   │
+                         │  │  (835 batch  │  │  (30s intervals) │   │
+                         │  │   processor) │  │                  │   │
+                         │  └──────────────┘  └──────────────────┘   │
+                         └────────────────────────────────────────────┘
+
+Flower task monitor: :5555
 ```
 
 **Claim lifecycle:**
 
 ```
-CREATED ──▶ VALIDATED ──▶ SUBMITTED ──▶ ADJUDICATED ──▶ PAID
-                                                    └──▶ DENIED
+CREATED ──▶ VALIDATED ──▶ SUBMITTING ──▶ SUBMITTED ──▶ ADJUDICATED ──▶ PAID
+                                    └──▶ CLEARINGHOUSE_REJECTED        └──▶ DENIED ──▶ SUBMITTING (resubmit)
 ```
 
 ---
@@ -42,21 +54,33 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Then seed the database:
+Then seed the database with 6 months of historical baseline claims:
 
 ```bash
-# Seed payor rules (allowlists, exclusions, diagnosis requirements)
-docker exec -w /app claimsprocessing-backend-1 python -m app.db.seed_rules
-
-# Seed sample claims in various states
 docker exec -w /app claimsprocessing-backend-1 python seed.py
 ```
 
-| Service  | URL                          |
-|----------|------------------------------|
-| Frontend | http://localhost:5173        |
-| API      | http://localhost:8000        |
-| API docs | http://localhost:8000/docs   |
+To compress 3 days of live billing activity into ~2 minutes (demo replay):
+
+```bash
+curl -X POST http://localhost:8000/demo/replay
+# poll progress
+curl http://localhost:8000/demo/replay/status
+```
+
+| Service      | URL                          |
+|--------------|------------------------------|
+| Frontend     | http://localhost:5173        |
+| API          | http://localhost:8000        |
+| API docs     | http://localhost:8000/docs   |
+| Flower (tasks) | http://localhost:5555      |
+
+**Run tests:**
+
+```bash
+cd backend
+.venv/bin/pytest tests/ -v
+```
 
 **Run tests:**
 
@@ -73,16 +97,19 @@ cd backend
 |--------|------|-------------|
 | `GET` | `/health` | Liveness check |
 | `POST` | `/claims` | Create a new claim |
-| `GET` | `/claims` | List all claims |
+| `GET` | `/claims` | List claims — filterable by status, payer, date; cursor-paginated |
 | `GET` | `/claims/{id}` | Get claim with full event history |
 | `POST` | `/claims/{id}/validate` | Run rules engine, CREATED → VALIDATED |
-| `POST` | `/claims/{id}/submit` | Submit to clearinghouse, VALIDATED → SUBMITTED |
+| `POST` | `/claims/{id}/submit` | Enqueue clearinghouse submission, VALIDATED → SUBMITTING |
 | `POST` | `/claims/{id}/adjudicate` | Record adjudication with financial terms |
 | `POST` | `/claims/{id}/pay` | Record payment, ADJUDICATED → PAID |
 | `POST` | `/claims/{id}/deny` | Record denial with reason, ADJUDICATED → DENIED |
-| `POST` | `/claims/{id}/resubmit` | Correction flow, DENIED → SUBMITTED |
+| `POST` | `/claims/{id}/resubmit` | Correction flow, DENIED → SUBMITTING |
 | `POST` | `/claims/{id}/remit` | Submit remit (EOB) for an adjudicated claim |
 | `GET` | `/claims/{id}/remit` | Get the remit with all adjustment codes |
+| `GET` | `/analytics/claims` | Denial rates, adjudication timing, aging, throughput by payer |
+| `POST` | `/demo/replay` | Compress 3 days of billing activity into ~2 minutes |
+| `GET` | `/demo/replay/status` | Poll replay progress from Redis |
 
 ---
 
@@ -106,7 +133,17 @@ cd backend
 
 - **Structured logging with per-request tracing.** Every request gets a UUID `request_id` generated at the middleware layer (or propagated from an upstream `X-Request-ID` header) and bound via `structlog.contextvars` so every log line within that request — validation, state machine, DB flush — carries it automatically. Output is pretty console in development, JSON in production (with `EventRenamer` so the message key matches what Datadog and CloudWatch expect). The middleware wraps `call_next` in `try/finally` so request completion is always logged even when a route raises an unhandled exception.
 
-- **What I'd add at scale.** Async claim submission via a message queue (Kafka or SQS) so the backend acknowledges receipt immediately and processes in the background — important for payers with slow adjudication APIs. OpenTelemetry tracing to map the full lifecycle of every claim across services. A dedicated denial classification service that parses raw remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Rate limiting and per-payer circuit breakers to handle payer API instability without cascading failures.
+- **Celery + Redis task queue with Beat scheduler.** The clearinghouse submission worker, remittance batch processor, and session completion generator all run as Celery tasks. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work asynchronously — the caller gets an immediate 202, the EDI handshake happens in the background. Beat fires background generators every 30 seconds post-replay so the system keeps producing live volume. Flower provides real-time task monitoring at `:5555`.
+
+- **Replay architecture for demo compression.** `POST /demo/replay` triggers a Celery orchestrator that compresses 3 days of billing activity into ~2 minutes. Within each simulated day it fires session completion bursts, submission tasks, and remittance batches at realistic ratios. Progress is tracked in Redis (`demo:replay:status`) and polled by the frontend every 3 seconds to update a live banner. This lets a viewer watch the Aetna denial rate climb in real time rather than seeing a pre-baked chart.
+
+- **Historical seed with deliberate baseline.** The seed script writes 300 historically resolved claims directly to the database with realistic timestamps going back 6 months. Aetna denial rates in the seed are intentionally unremarkable (~15%). The live remittance worker cranks Aetna 90837 to 35% during replay — the anomaly emerges in the analytics charts in real time rather than being pre-loaded.
+
+- **Cursor-based pagination on `GET /claims`.** Cursor encodes `(created_at, id)` as base64 JSON. The WHERE clause uses `(created_at, id) < (cursor_created_at, cursor_id)` with `ORDER BY created_at DESC, id DESC` — cost is constant regardless of how deep into the result set you page, unlike offset pagination which degrades as page number grows.
+
+- **Analytics endpoint from the event ledger.** `GET /analytics/claims` aggregates directly from `claim_events` rather than the claims table. This gives accurate time-series metrics: avg days SUBMITTED→ADJUDICATED per payer (using event pairs), aging counts by how long claims have been in SUBMITTED state, throughput in the last 24 hours. The event ledger is the source of truth.
+
+- **What I'd add at scale.** Async claim submission via Kafka so the backend acknowledges receipt immediately and processes in the background. OpenTelemetry tracing to stitch together the full lifecycle across services. A dedicated denial classification service that parses remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Rate limiting and per-payer circuit breakers to handle payer API instability without cascading failures.
 
 ---
 
@@ -114,11 +151,12 @@ cd backend
 
 | Layer | Technology |
 |-------|-----------|
-| Frontend | React 18, TypeScript, Vite 6, Tailwind CSS v4 |
+| Frontend | React 18, TypeScript, Vite 6, Tailwind CSS v4, Recharts |
 | Backend | FastAPI, SQLAlchemy 2.0, Alembic, structlog, Python 3.12 |
+| Task queue | Celery 5, Redis 7, Celery Beat, Flower |
 | Database | PostgreSQL 16 |
-| Infrastructure | Docker Compose |
-| Testing | pytest (69 unit tests) |
+| Infrastructure | Docker Compose (6 services) |
+| Testing | pytest |
 
 ---
 
