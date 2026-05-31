@@ -29,10 +29,11 @@ Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submi
 
 ## SEGMENT 1 — THE QUEUE ARCHITECTURE (60 seconds)
 
-> "The backend is FastAPI with a Celery task queue backed by Redis. Three worker types:
-> session completion generators that create claims as therapists finish appointments,
-> a clearinghouse submission worker that hands claims to the EDI network, and a
-> remittance batch processor that handles 835 files as payers adjudicate claims.
+> "The backend is FastAPI with a Celery task queue backed by Redis. Two independent
+> workers: a clearinghouse submission worker that picks up SUBMITTING claims from the
+> queue and handles the EDI round-trip — 80% go to SUBMITTED, 20% get clearinghouse
+> rejected. And a remittance batch processor on a Beat schedule that fires every 10
+> seconds, finds SUBMITTED claims, and adjudicates them with payer-specific denial rates.
 >
 > In a real Grow Therapy system these workers consume events from session completion
 > webhooks from the EHR, 835 file drops from the clearinghouse, and payer API polling.
@@ -142,10 +143,11 @@ Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submi
 
 **Show:** `docker compose logs worker` — structured log lines from the remittance processor
 
-> "What I'd add at production scale: async claim submission via Kafka so the backend
-> acknowledges receipt immediately, OpenTelemetry tracing to stitch together the full
-> lifecycle across services, a denial classification service that turns CO-97 and PR-1
-> codes into structured action items for billing teams, and per-payer circuit breakers
+> "What I'd add at production scale: replace Redis/Celery with SQS and Lambda so
+> workers scale to zero and the DLQ is a first-class infrastructure primitive rather
+> than configuration. OpenTelemetry tracing via X-Ray to stitch together the full
+> lifecycle across services. A denial classification service that turns CO-97 and PR-1
+> codes into structured action items for billing teams. And per-payer circuit breakers
 > to handle payer API instability without cascading failures."
 
 ---

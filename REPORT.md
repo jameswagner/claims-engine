@@ -8,16 +8,17 @@ An internal billing operations platform modeled on the kind of system that handl
 
 ## Architecture
 
-Six Docker services:
+Seven Docker services:
 
 | Service | Image | Purpose |
 |---------|-------|---------|
 | `db` | postgres:16-alpine | Primary datastore |
 | `redis` | redis:7-alpine | Celery broker + result backend + fast-forward state |
 | `backend` | ./backend | FastAPI API server (uvicorn) |
-| `worker` | ./backend | Celery worker — clearinghouse, remittance, generators |
+| `worker` | ./backend | Celery worker — clearinghouse submission, remittance batch |
 | `beat` | ./backend | Celery Beat — fires remittance batch every 10s |
 | `flower` | mher/flower:2.0 | Task monitoring UI at :5555 |
+| `frontend` | ./frontend | React + Vite dev server |
 
 **Claim lifecycle:**
 
@@ -45,7 +46,7 @@ backend/app/
 ├── api/                 # Route handlers
 │   ├── claims.py        # full lifecycle endpoints
 │   ├── remits.py        # EOB submission and retrieval
-│   ├── analytics.py     # aggregations from event ledger (in progress)
+│   ├── analytics.py     # denial rate by payer/CPT, aging, adjudication timing
 │   └── demo.py          # fast-forward trigger and status polling
 ├── claims/
 │   ├── state_machine.py # transition() — validates, locks, writes event
@@ -53,10 +54,10 @@ backend/app/
 ├── rules/
 │   └── validator.py     # DB-driven rules engine
 └── tasks/               # Celery task modules
-    ├── generators.py    # session completion events → CREATED/VALIDATED claims
+    ├── generators.py    # _create_one_claim() utility — used by fast_forward
     ├── submission.py    # clearinghouse EDI handshake, 80/20 success/reject
     ├── remittance.py    # 835 batch processor, payer-specific denial rates
-    └── fast_forward.py  # dumb firehose: creates claims, enqueues submissions
+    └── fast_forward.py  # demo firehose: creates claims, enqueues submissions
 ```
 
 ---

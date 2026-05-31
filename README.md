@@ -136,7 +136,7 @@ cd backend
 
 - **Analytics endpoint from the event ledger.** `GET /analytics/claims` aggregates directly from `claim_events` rather than the claims table. This gives accurate time-series metrics: denial rate by payer, denial rate by CPT code, avg days SUBMITTED→ADJUDICATED per payer (using event pairs), aging counts by how long claims have been in SUBMITTED state, throughput in the last 24 hours. The event ledger is the source of truth.
 
-- **What I'd add at scale.** Async claim submission via Kafka so the backend acknowledges receipt immediately and processes in the background. OpenTelemetry tracing to stitch together the full lifecycle across services. A dedicated denial classification service that parses remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Rate limiting and per-payer circuit breakers to handle payer API instability without cascading failures.
+- **What I'd add at scale.** Replace Redis/Celery with SQS and Lambda: workers scale to zero, the DLQ is a first-class AWS primitive, and visibility timeout replaces manual retry logic. ECS Fargate behind an ALB for the API, RDS Aurora with RDS Proxy for connection pooling at scale, S3 + CloudFront for the frontend. OpenTelemetry tracing via X-Ray to stitch together the full lifecycle across services. A dedicated denial classification service that parses remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Per-payer circuit breakers to handle payer API instability without cascading failures.
 
 ---
 
