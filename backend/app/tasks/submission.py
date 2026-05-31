@@ -6,6 +6,7 @@ import structlog
 from sqlalchemy import select
 
 from app.celery_app import celery
+from app.claims.exceptions import DuplicateTransitionError
 from app.claims.state_machine import transition
 from app.db.session import SessionLocal
 from app.models.claim import Claim
@@ -49,7 +50,7 @@ def process_submission(self, claim_id_str: str, idempotency_key: str) -> dict:
             return {"status": "skipped", "reason": f"status_is_{claim.status.value}"}
 
         # Simulate EDI round-trip latency
-        time.sleep(random.uniform(0.5, 2.0))
+        time.sleep(random.uniform(0.1, 0.3))
 
         if random.random() < _CLEARINGHOUSE_REJECTION_RATE:
             transition(
@@ -73,6 +74,9 @@ def process_submission(self, claim_id_str: str, idempotency_key: str) -> dict:
         log.info("submission_processed", claim_id=claim_id_str, outcome=outcome)
         return {"status": outcome, "claim_id": claim_id_str}
 
+    except DuplicateTransitionError:
+        log.info("submission_already_processed", claim_id=claim_id_str)
+        return {"status": "already_processed", "claim_id": claim_id_str}
     except Exception as exc:
         db.rollback()
         log.error("submission_failed", claim_id=claim_id_str, error=str(exc))

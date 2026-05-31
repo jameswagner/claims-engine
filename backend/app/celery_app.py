@@ -12,7 +12,7 @@ celery = Celery(
         "app.tasks.generators",
         "app.tasks.submission",
         "app.tasks.remittance",
-        "app.tasks.replay",
+        "app.tasks.fast_forward",
     ],
 )
 
@@ -23,9 +23,9 @@ celery.conf.update(
     timezone="UTC",
     enable_utc=True,
     beat_schedule={
-        "background-generators": {
-            "task": "app.tasks.generators.run_background_generators",
-            "schedule": 30.0,
+        "remittance-batch": {
+            "task": "app.tasks.remittance.process_remittance_batch",
+            "schedule": 10.0,
         },
     },
 )

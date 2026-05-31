@@ -8,3 +8,4 @@ dist/
 .DS_Store
 CLAIMS_101.md
 PLAN.md
+backend/celerybeat-schedule

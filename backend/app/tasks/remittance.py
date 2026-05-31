@@ -42,7 +42,7 @@ def _denial_rate(payer: str, cpt_code: str) -> float:
 
 
 @celery.task(name="app.tasks.remittance.process_remittance_batch")
-def process_remittance_batch(limit: int = 10) -> dict:
+def process_remittance_batch(limit: int = 50) -> dict:
     """
     Simulate 835 EOB batch processing. Finds up to `limit` SUBMITTED claims
     oldest-first and adjudicates them with payer-specific denial rates.

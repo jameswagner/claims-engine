@@ -47,9 +47,17 @@ class Throughput24h(BaseModel):
     denied: int
 
 
+class CptDenialRate(BaseModel):
+    cpt_code: str
+    total: int
+    denied: int
+    denial_rate_pct: float
+
+
 class ClaimsAnalytics(BaseModel):
     claims_by_status: dict[str, int]
     denial_rate_by_payer: list[PayerDenialRate]
+    denial_rate_by_cpt: list[CptDenialRate]
     avg_days_to_adjudication_by_payer: list[PayerAdjDays]
     aging_summary: AgingSummary
     resubmission_success_rate: ResubmissionRate
@@ -98,6 +106,38 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
             denial_rate_pct=round(v["denied"] / v["total"] * 100, 1) if v["total"] else 0.0,
         )
         for p, v in sorted(payer_totals.items())
+    ]
+
+    # --- Denial rate by CPT code ---
+    cpt_events = db.execute(
+        select(
+            Claim.cpt_code,
+            ClaimEvent.to_status,
+            func.count().label("n"),
+        )
+        .join(Claim, Claim.id == ClaimEvent.claim_id)
+        .where(ClaimEvent.from_status == ClaimStatus.ADJUDICATED)
+        .where(ClaimEvent.to_status.in_([ClaimStatus.PAID, ClaimStatus.DENIED]))
+        .group_by(Claim.cpt_code, ClaimEvent.to_status)
+    ).all()
+
+    cpt_totals: dict[str, dict[str, int]] = {}
+    for row in cpt_events:
+        c = row.cpt_code
+        if c not in cpt_totals:
+            cpt_totals[c] = {"total": 0, "denied": 0}
+        cpt_totals[c]["total"] += row.n
+        if row.to_status == ClaimStatus.DENIED:
+            cpt_totals[c]["denied"] += row.n
+
+    denial_rate_by_cpt = [
+        CptDenialRate(
+            cpt_code=c,
+            total=v["total"],
+            denied=v["denied"],
+            denial_rate_pct=round(v["denied"] / v["total"] * 100, 1) if v["total"] else 0.0,
+        )
+        for c, v in sorted(cpt_totals.items())
     ]
 
     # --- Avg days to adjudication by payer ---
@@ -207,6 +247,7 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
     return ClaimsAnalytics(
         claims_by_status=claims_by_status,
         denial_rate_by_payer=denial_rate_by_payer,
+        denial_rate_by_cpt=denial_rate_by_cpt,
         avg_days_to_adjudication_by_payer=avg_days_by_payer,
         aging_summary=aging_summary,
         resubmission_success_rate=resubmission_rate,

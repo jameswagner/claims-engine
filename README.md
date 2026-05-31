@@ -20,14 +20,14 @@ An internal billing operations platform for monitoring and processing insurance 
                          ┌─────────────────────▼──────────────────────┐
                          │  Celery Workers                             │
                          │  ┌──────────────┐  ┌──────────────────┐   │
-                         │  │  generators  │  │  submission      │   │
-                         │  │  (CREATED→   │  │  (clearinghouse  │   │
-                         │  │   VALIDATED) │  │   EDI handshake) │   │
+                         │  │ fast-forward │  │  submission      │   │
+                         │  │ (demo burst  │  │  (clearinghouse  │   │
+                         │  │  firehose)   │  │   EDI handshake) │   │
                          │  └──────────────┘  └──────────────────┘   │
                          │  ┌──────────────┐  ┌──────────────────┐   │
                          │  │  remittance  │  │  Beat scheduler  │   │
-                         │  │  (835 batch  │  │  (30s intervals) │   │
-                         │  │   processor) │  │                  │   │
+                         │  │  (835 batch  │  │  (10s remittance │   │
+                         │  │   processor) │  │   trigger)       │   │
                          │  └──────────────┘  └──────────────────┘   │
                          └────────────────────────────────────────────┘
 
@@ -60,12 +60,12 @@ Then seed the database with 6 months of historical baseline claims:
 docker exec -w /app claimsprocessing-backend-1 python seed.py
 ```
 
-To compress 3 days of live billing activity into ~2 minutes (demo replay):
+To compress 3 days of live billing activity into ~2 minutes (fast-forward):
 
 ```bash
-curl -X POST http://localhost:8000/demo/replay
+curl -X POST http://localhost:8000/demo/fast-forward
 # poll progress
-curl http://localhost:8000/demo/replay/status
+curl http://localhost:8000/demo/fast-forward/status
 ```
 
 | Service      | URL                          |
@@ -101,8 +101,8 @@ cd backend
 | `POST` | `/claims/{id}/remit` | Submit remit (EOB) for an adjudicated claim |
 | `GET` | `/claims/{id}/remit` | Get the remit with all adjustment codes |
 | `GET` | `/analytics/claims` | Denial rates, adjudication timing, aging, throughput by payer |
-| `POST` | `/demo/replay` | Compress 3 days of billing activity into ~2 minutes |
-| `GET` | `/demo/replay/status` | Poll replay progress from Redis |
+| `POST` | `/demo/fast-forward` | Compress 3 days of billing activity into ~2 minutes |
+| `GET` | `/demo/fast-forward/status` | Poll fast-forward progress from Redis |
 
 ---
 
@@ -126,15 +126,15 @@ cd backend
 
 - **Structured logging with per-request tracing.** Every request gets a UUID `request_id` generated at the middleware layer (or propagated from an upstream `X-Request-ID` header) and bound via `structlog.contextvars` so every log line within that request — validation, state machine, DB flush — carries it automatically. Output is pretty console in development, JSON in production (with `EventRenamer` so the message key matches what Datadog and CloudWatch expect). The middleware wraps `call_next` in `try/finally` so request completion is always logged even when a route raises an unhandled exception.
 
-- **Celery + Redis task queue with Beat scheduler.** The clearinghouse submission worker, remittance batch processor, and session completion generator all run as Celery tasks. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work asynchronously — the caller gets an immediate 202, the EDI handshake happens in the background. Beat fires background generators every 30 seconds post-replay so the system keeps producing live volume. Flower provides real-time task monitoring at `:5555`.
+- **Celery + Redis task queue with Beat scheduler.** The clearinghouse submission worker and remittance batch processor run as Celery tasks. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work asynchronously — the caller gets an immediate 202, the EDI handshake happens in the background. Beat fires the remittance batch processor every 10 seconds so the system continuously adjudicates SUBMITTED claims. Flower provides real-time task monitoring at `:5555`.
 
-- **Replay architecture for demo compression.** `POST /demo/replay` triggers a Celery orchestrator that compresses 3 days of billing activity into ~2 minutes. Within each simulated day it fires session completion bursts, submission tasks, and remittance batches at realistic ratios. Progress is tracked in Redis (`demo:replay:status`) and polled by the frontend every 3 seconds to update a live banner. This lets a viewer watch the Aetna denial rate climb in real time rather than seeing a pre-baked chart.
+- **Fast-forward architecture for demo compression.** `POST /demo/fast-forward` triggers a Celery task that compresses 3 days of billing activity into ~2 minutes — a dumb firehose that creates claims in bursts and drops them into the submission queue. The independent submission worker and Beat-scheduled remittance worker handle everything from there. Progress is tracked in Redis (`demo:fast_forward:status`) and polled by the frontend every 3 seconds to update a live banner. This lets a viewer watch the Aetna denial rate climb in real time rather than seeing a pre-baked chart.
 
-- **Historical seed with deliberate baseline.** The seed script writes 300 historically resolved claims directly to the database with realistic timestamps going back 6 months. Aetna denial rates in the seed are intentionally unremarkable (~15%). The live remittance worker cranks Aetna 90837 to 35% during replay — the anomaly emerges in the analytics charts in real time rather than being pre-loaded.
+- **Historical seed with deliberate baseline.** The seed script writes 300 historically resolved claims directly to the database with realistic timestamps going back 6 months. Aetna denial rates in the seed are intentionally unremarkable (~15%). The live remittance worker cranks Aetna 90837 to 35% during fast-forward — the anomaly emerges in the analytics charts in real time rather than being pre-loaded.
 
 - **Cursor-based pagination on `GET /claims`.** Cursor encodes `(created_at, id)` as base64 JSON. The WHERE clause uses `(created_at, id) < (cursor_created_at, cursor_id)` with `ORDER BY created_at DESC, id DESC` — cost is constant regardless of how deep into the result set you page, unlike offset pagination which degrades as page number grows.
 
-- **Analytics endpoint from the event ledger.** `GET /analytics/claims` aggregates directly from `claim_events` rather than the claims table. This gives accurate time-series metrics: avg days SUBMITTED→ADJUDICATED per payer (using event pairs), aging counts by how long claims have been in SUBMITTED state, throughput in the last 24 hours. The event ledger is the source of truth.
+- **Analytics endpoint from the event ledger.** `GET /analytics/claims` aggregates directly from `claim_events` rather than the claims table. This gives accurate time-series metrics: denial rate by payer, denial rate by CPT code, avg days SUBMITTED→ADJUDICATED per payer (using event pairs), aging counts by how long claims have been in SUBMITTED state, throughput in the last 24 hours. The event ledger is the source of truth.
 
 - **What I'd add at scale.** Async claim submission via Kafka so the backend acknowledges receipt immediately and processes in the background. OpenTelemetry tracing to stitch together the full lifecycle across services. A dedicated denial classification service that parses remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Rate limiting and per-payer circuit breakers to handle payer API instability without cascading failures.
 

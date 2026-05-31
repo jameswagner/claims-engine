@@ -39,6 +39,12 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
 
   worker:
     build: ./backend
@@ -49,9 +55,7 @@ services:
     volumes:
       - ./backend:/app
     depends_on:
-      db:
-        condition: service_healthy
-      redis:
+      backend:
         condition: service_healthy
 
   beat:
@@ -63,7 +67,7 @@ services:
     volumes:
       - ./backend:/app
     depends_on:
-      redis:
+      backend:
         condition: service_healthy
 
   flower:

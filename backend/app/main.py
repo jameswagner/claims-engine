@@ -39,6 +39,7 @@ async def request_logging_middleware(request: Request, call_next) -> Response:
     start = time.perf_counter()
     log.info("request_started", method=request.method, path=request.url.path)
 
+    response = None
     try:
         response = await call_next(request)
     finally:

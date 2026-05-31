@@ -13,10 +13,10 @@ Six Docker services:
 | Service | Image | Purpose |
 |---------|-------|---------|
 | `db` | postgres:16-alpine | Primary datastore |
-| `redis` | redis:7-alpine | Celery broker + result backend + replay state |
+| `redis` | redis:7-alpine | Celery broker + result backend + fast-forward state |
 | `backend` | ./backend | FastAPI API server (uvicorn) |
 | `worker` | ./backend | Celery worker — clearinghouse, remittance, generators |
-| `beat` | ./backend | Celery Beat — fires background generators every 30s |
+| `beat` | ./backend | Celery Beat — fires remittance batch every 10s |
 | `flower` | mher/flower:2.0 | Task monitoring UI at :5555 |
 
 **Claim lifecycle:**
@@ -46,7 +46,7 @@ backend/app/
 │   ├── claims.py        # full lifecycle endpoints
 │   ├── remits.py        # EOB submission and retrieval
 │   ├── analytics.py     # aggregations from event ledger (in progress)
-│   └── demo.py          # replay trigger and status polling (in progress)
+│   └── demo.py          # fast-forward trigger and status polling
 ├── claims/
 │   ├── state_machine.py # transition() — validates, locks, writes event
 │   └── exceptions.py
@@ -56,7 +56,7 @@ backend/app/
     ├── generators.py    # session completion events → CREATED/VALIDATED claims
     ├── submission.py    # clearinghouse EDI handshake, 80/20 success/reject
     ├── remittance.py    # 835 batch processor, payer-specific denial rates
-    └── replay.py        # orchestrator: compresses 3 days into ~2 minutes
+    └── fast_forward.py  # dumb firehose: creates claims, enqueues submissions
 ```
 
 ---
@@ -75,13 +75,13 @@ Every transition endpoint requires an `Idempotency-Key` header — a UUID the ca
 
 `BackgroundTasks` has no durability, no retry, no monitoring — a restart drops everything in flight. Celery adds retry logic, dead-letter queues, and Flower observability. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work — the caller gets an immediate response, the EDI handshake happens in the background. Flower at `:5555` gives an on-call engineer full visibility into what workers are doing.
 
-### Replay Architecture
+### Fast-forward Architecture
 
-`POST /demo/replay` enqueues a Celery orchestrator that compresses 3 days of billing activity into ~2 minutes. Within each simulated day it fires session completion bursts, submission tasks, and remittance batches at realistic ratios. Progress is tracked in Redis (`demo:replay:status`) and polled by the frontend every 3 seconds for a live progress banner.
+`POST /demo/fast-forward` triggers a Celery task that compresses 3 days of billing activity into ~2 minutes — a dumb firehose that creates claims in bursts and enqueues submission tasks. The independent submission worker processes the queue (80% SUBMITTED, 20% CLEARINGHOUSE_REJECTED), and the Beat-scheduled remittance worker adjudicates SUBMITTED claims on its own 10-second cadence. No orchestration between them. Progress is tracked in Redis (`demo:fast_forward:status`) and polled by the frontend every 3 seconds for a live progress banner.
 
 ### Historical Seed vs Live Workers
 
-The seed script (`seed.py`) writes 300 historically resolved claims directly to the DB with Aetna denial rates at ~15% — unremarkable. The live remittance worker uses Aetna's real-world 35% denial rate on 90837. During a demo replay, the analytics charts update in real time as the Aetna bar climbs above the others. The anomaly emerges rather than being pre-baked.
+The seed script (`seed.py`) writes 300 historically resolved claims directly to the DB with Aetna denial rates at ~15% — unremarkable. The live remittance worker uses Aetna's real-world 35% denial rate on 90837. During a fast-forward, the analytics charts update in real time as the Aetna bar climbs above the others. The anomaly emerges rather than being pre-baked.
 
 ### Immutable Event Ledger
 
@@ -135,9 +135,9 @@ Financial fields on `Claim`: `billed_amount` (at creation), `allowed_amount` + `
 | Structured logging + request tracing | ✅ Complete |
 | Celery + Redis + Flower infrastructure | ✅ Complete |
 | Historical seed (300 claims, 6 months) | ✅ Complete |
-| Task modules (generators, submission, remittance) | In progress |
-| Replay mode (demo endpoint) | In progress |
-| Analytics endpoint | In progress |
-| Cursor pagination + filtering on GET /claims | In progress |
-| Dashboard (replay banner, charts, metrics) | In progress |
-| Worklist (tabs, filters, request badge) | In progress |
+| Task modules (submission, remittance, fast-forward) | ✅ Complete |
+| Fast-forward mode (demo endpoint) | ✅ Complete |
+| Analytics endpoint | ✅ Complete |
+| Cursor pagination + filtering on GET /claims | ✅ Complete |
+| Dashboard (fast-forward banner, charts, metrics) | ✅ Complete |
+| Worklist (tabs, filters, request badge) | ✅ Complete |

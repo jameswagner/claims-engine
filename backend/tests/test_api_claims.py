@@ -118,32 +118,26 @@ def test_validate_rules_failure_returns_422(mock_t, client, db):
 # POST /claims/{id}/submit
 # ---------------------------------------------------------------------------
 
-@patch("app.api.claims.time.sleep")
+@patch("app.tasks.submission.process_submission.delay")
 @patch("app.api.claims.transition")
-def test_submit_success(mock_t, mock_sleep, client, db):
+def test_submit_success(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.VALIDATED)
     db.scalar.return_value = claim
     mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
     response = client.post(f"/claims/{claim.id}/submit", json={}, headers=IK)
-    assert response.status_code == 200
-    assert response.json()["status"] == "SUBMITTED"
+    assert response.status_code == 202
+    assert response.json()["status"] == "SUBMITTING"
 
 
-@patch("app.api.claims.time.sleep")
+@patch("app.tasks.submission.process_submission.delay")
 @patch("app.api.claims.transition")
-def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_sleep, client, db):
+def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.VALIDATED)
     db.scalar.return_value = claim
     calls = []
     mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
     client.post(f"/claims/{claim.id}/submit", json={"clearinghouse_ref": "CH-12345"}, headers=IK)
     assert calls[0] == "CH-12345"
-
-
-def test_submit_calls_sleep(client, db):
-    db.scalar.return_value = None  # trigger 404 before sleep matters
-    client.post(f"/claims/{uuid.uuid4()}/submit", json={}, headers=IK)
-    # 404 returned before sleep is reached — no assertion needed
 
 
 # ---------------------------------------------------------------------------
@@ -237,21 +231,21 @@ def test_deny_missing_reason_returns_422(client, db):
 # POST /claims/{id}/resubmit
 # ---------------------------------------------------------------------------
 
-@patch("app.api.claims.time.sleep")
+@patch("app.tasks.submission.process_submission.delay")
 @patch("app.api.claims.transition")
-def test_resubmit_success(mock_t, mock_sleep, client, db):
+def test_resubmit_success(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.DENIED)
     db.scalar.return_value = claim
     mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
     body = {"correction_notes": "Added modifier HO"}
     response = client.post(f"/claims/{claim.id}/resubmit", json=body, headers=IK)
-    assert response.status_code == 200
-    assert response.json()["status"] == "SUBMITTED"
+    assert response.status_code == 202
+    assert response.json()["status"] == "SUBMITTING"
 
 
-@patch("app.api.claims.time.sleep")
+@patch("app.tasks.submission.process_submission.delay")
 @patch("app.api.claims.transition")
-def test_resubmit_passes_correction_notes_as_reason(mock_t, mock_sleep, client, db):
+def test_resubmit_passes_correction_notes_as_reason(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.DENIED)
     db.scalar.return_value = claim
     calls = []

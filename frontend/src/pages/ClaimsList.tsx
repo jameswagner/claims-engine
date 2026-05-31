@@ -1,90 +1,196 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { createClaim, fetchClaims, parseApiError } from '../api/claims'
+import { fetchClaims, getLastRequestMeta } from '../api/claims'
+import { NavBar } from '../components/NavBar'
 import { StatusBadge } from '../components/StatusBadge'
-import type { Claim } from '../types/claim'
+import type { Claim, ClaimStatus } from '../types/claim'
 
-const SAMPLE_CLAIM = {
-  patient_name: 'Alex Rivera',
-  provider_name: 'Dr. Sarah Chen',
-  cpt_code: '90837',
-  diagnosis_code: 'F32.1',
-  insurance_payer: 'Aetna',
-  billed_amount: 200.00,
+type Tab = 'all' | 'denied' | 'aging'
+
+const TABS: { key: Tab; label: string }[] = [
+  { key: 'all', label: 'All Claims' },
+  { key: 'denied', label: 'Exceptions (Denied)' },
+  { key: 'aging', label: 'Aging (>30 days)' },
+]
+
+const PAYERS = ['Aetna', 'Cigna', 'BCBS', 'UnitedHealthcare', 'Humana']
+
+const STATUSES: ClaimStatus[] = [
+  'CREATED', 'VALIDATED', 'SUBMITTING', 'SUBMITTED',
+  'CLEARINGHOUSE_REJECTED', 'ADJUDICATED', 'PAID', 'DENIED',
+]
+
+function ageDays(claim: Claim): number {
+  return Math.floor((Date.now() - new Date(claim.created_at).getTime()) / 86_400_000)
+}
+
+function isAging(claim: Claim): boolean {
+  if (claim.status !== 'SUBMITTED') return false
+  return ageDays(claim) > 30
+}
+
+function formatDate(iso: string) {
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function formatCurrency(n: number | null) {
+  if (n === null) return '—'
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 }
 
 export function ClaimsList() {
   const [claims, setClaims] = useState<Claim[]>([])
-  const [creating, setCreating] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [tab, setTab] = useState<Tab>('all')
+  const [filterPayer, setFilterPayer] = useState('')
+  const [filterStatus, setFilterStatus] = useState<ClaimStatus | ''>('')
+  const [requestBadge, setRequestBadge] = useState<{ id: string; ms: number } | null>(null)
   const navigate = useNavigate()
+  const badgeTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  useEffect(() => {
-    fetchClaims().then(setClaims).catch(() => setError('Failed to load claims'))
-  }, [])
-
-  async function handleCreate() {
-    setCreating(true)
-    setError(null)
+  async function load() {
+    setLoading(true)
     try {
-      const claim = await createClaim(SAMPLE_CLAIM)
-      navigate(`/claims/${claim.id}`)
-    } catch (e) {
-      setError(parseApiError(e))
-      setCreating(false)
+      const data = await fetchClaims()
+      setClaims(data)
+      const meta = getLastRequestMeta()
+      if (meta?.requestId) {
+        setRequestBadge({ id: meta.requestId.slice(0, 8), ms: meta.durationMs })
+        if (badgeTimer.current) clearTimeout(badgeTimer.current)
+        badgeTimer.current = setTimeout(() => setRequestBadge(null), 4000)
+      }
+    } finally {
+      setLoading(false)
     }
   }
 
+  useEffect(() => {
+    load()
+    const id = setInterval(load, 20_000)
+    return () => { clearInterval(id); if (badgeTimer.current) clearTimeout(badgeTimer.current) }
+  }, [])
+
+  const visible = claims.filter(c => {
+    if (tab === 'denied' && c.status !== 'DENIED') return false
+    if (tab === 'aging' && !isAging(c)) return false
+    if (filterPayer && c.insurance_payer !== filterPayer) return false
+    if (filterStatus && c.status !== filterStatus) return false
+    return true
+  })
+
   return (
     <div className="min-h-screen bg-gray-50">
-      <div className="max-w-5xl mx-auto px-4 py-10">
+      <NavBar />
 
-        <div className="flex items-center justify-between mb-8">
-          <div>
-            <h1 className="text-2xl font-bold text-gray-900">Claims</h1>
-            <p className="text-sm text-gray-500 mt-0.5">Lifecycle tracker</p>
-          </div>
-          <button
-            onClick={handleCreate}
-            disabled={creating}
-            className="px-4 py-2 bg-blue-600 text-white text-sm font-medium rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors"
-          >
-            {creating ? 'Creating…' : '+ Create Test Claim'}
-          </button>
+      <div className="max-w-6xl mx-auto px-6 py-8">
+
+        <div className="flex items-center justify-between mb-6">
+          <h1 className="text-xl font-bold text-gray-900">Worklist</h1>
+          <span className="text-sm text-gray-400">{visible.length} claims</span>
         </div>
 
-        {error && (
-          <p className="mb-4 text-sm text-red-600">{error}</p>
-        )}
+        {/* Tabs */}
+        <div className="flex gap-1 mb-4 border-b border-gray-200">
+          {TABS.map(t => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              className={`px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+                tab === t.key
+                  ? 'border-indigo-600 text-indigo-700'
+                  : 'border-transparent text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              {t.label}
+              {t.key === 'denied' && claims.filter(c => c.status === 'DENIED').length > 0 && (
+                <span className="ml-2 bg-red-100 text-red-700 text-xs rounded-full px-1.5 py-0.5">
+                  {claims.filter(c => c.status === 'DENIED').length}
+                </span>
+              )}
+              {t.key === 'aging' && claims.filter(isAging).length > 0 && (
+                <span className="ml-2 bg-amber-100 text-amber-700 text-xs rounded-full px-1.5 py-0.5">
+                  {claims.filter(isAging).length}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
 
-        {claims.length === 0 ? (
-          <div className="text-center py-20 text-gray-400">
-            <p className="text-lg">No claims yet.</p>
-            <p className="text-sm mt-1">Hit "Create Test Claim" to get started.</p>
-          </div>
-        ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {claims.map(claim => (
-              <button
-                key={claim.id}
-                onClick={() => navigate(`/claims/${claim.id}`)}
-                className="text-left bg-white rounded-xl shadow-sm border border-gray-100 p-5 hover:shadow-md hover:border-gray-200 transition-all"
-              >
-                <div className="flex items-start justify-between mb-3">
-                  <div className="min-w-0">
-                    <p className="font-semibold text-gray-900 truncate">{claim.patient_name}</p>
-                    <p className="text-sm text-gray-500 truncate">{claim.provider_name}</p>
-                  </div>
-                  <div className="ml-2 shrink-0">
-                    <StatusBadge status={claim.status} />
-                  </div>
-                </div>
-                <div className="text-sm text-gray-500 space-y-0.5">
-                  <p>{claim.insurance_payer} · CPT {claim.cpt_code}</p>
-                  <p className="font-mono text-xs text-gray-400">{claim.diagnosis_code}</p>
-                </div>
-              </button>
-            ))}
+        {/* Filters */}
+        <div className="flex gap-3 mb-4">
+          <select
+            value={filterPayer}
+            onChange={e => setFilterPayer(e.target.value)}
+            className="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+          >
+            <option value="">All payers</option>
+            {PAYERS.map(p => <option key={p}>{p}</option>)}
+          </select>
+
+          {tab === 'all' && (
+            <select
+              value={filterStatus}
+              onChange={e => setFilterStatus(e.target.value as ClaimStatus | '')}
+              className="text-sm border border-gray-200 rounded-lg px-3 py-1.5 bg-white text-gray-700 focus:outline-none focus:ring-2 focus:ring-indigo-300"
+            >
+              <option value="">All statuses</option>
+              {STATUSES.map(s => <option key={s}>{s}</option>)}
+            </select>
+          )}
+        </div>
+
+        {/* Table */}
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
+          {loading && claims.length === 0 ? (
+            <div className="py-16 text-center text-gray-400 text-sm">Loading…</div>
+          ) : visible.length === 0 ? (
+            <div className="py-16 text-center text-gray-400 text-sm">No claims match the current filters.</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-gray-50 border-b border-gray-200 text-xs font-semibold text-gray-500 uppercase tracking-wider">
+                  <th className="text-left px-4 py-3">Patient</th>
+                  <th className="text-left px-4 py-3">Provider</th>
+                  <th className="text-left px-4 py-3">Payer</th>
+                  <th className="text-left px-4 py-3">CPT</th>
+                  <th className="text-left px-4 py-3">Status</th>
+                  <th className="text-right px-4 py-3">Billed</th>
+                  <th className="text-left px-4 py-3">Created</th>
+                  <th className="text-right px-4 py-3">Age</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {visible.map(claim => {
+                  const age = ageDays(claim)
+                  const aging = isAging(claim)
+                  return (
+                    <tr
+                      key={claim.id}
+                      onClick={() => navigate(`/claims/${claim.id}`)}
+                      className={`cursor-pointer transition-colors hover:bg-gray-50 ${aging ? 'bg-amber-50/40' : ''}`}
+                    >
+                      <td className="px-4 py-3 font-medium text-gray-900">{claim.patient_name}</td>
+                      <td className="px-4 py-3 text-gray-500">{claim.provider_name}</td>
+                      <td className="px-4 py-3 text-gray-600">{claim.insurance_payer}</td>
+                      <td className="px-4 py-3 font-mono text-gray-600">{claim.cpt_code}</td>
+                      <td className="px-4 py-3"><StatusBadge status={claim.status} /></td>
+                      <td className="px-4 py-3 text-right text-gray-700">{formatCurrency(claim.billed_amount)}</td>
+                      <td className="px-4 py-3 text-gray-400">{formatDate(claim.created_at)}</td>
+                      <td className={`px-4 py-3 text-right font-mono text-xs ${aging ? 'text-amber-700 font-semibold' : 'text-gray-400'}`}>
+                        {age}d
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* Request tracer badge */}
+        {requestBadge && (
+          <div className="fixed bottom-4 right-4 bg-gray-900 text-gray-300 text-xs px-3 py-2 rounded-lg font-mono shadow-lg">
+            ↩ {requestBadge.ms}ms · req-{requestBadge.id}
           </div>
         )}
       </div>

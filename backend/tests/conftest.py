@@ -39,6 +39,7 @@ def make_remit(claim_id=None, **overrides):
     defaults = dict(
         id=uuid.uuid4(),
         claim_id=claim_id or uuid.uuid4(),
+        idempotency_key=str(uuid.uuid4()),
         raw_response='{"payer": "Aetna"}',
         processed_at=datetime.now(timezone.utc),
         total_billed=Decimal("200.00"),

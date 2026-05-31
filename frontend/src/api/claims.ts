@@ -2,16 +2,29 @@ import type { Claim, ClaimDetail } from '../types/claim'
 
 const BASE = import.meta.env.VITE_API_URL
 
+export interface RequestMeta {
+  requestId: string
+  durationMs: number
+}
+
+let _lastMeta: RequestMeta | null = null
+export const getLastRequestMeta = () => _lastMeta
+
 interface ApiError {
   status: number
   detail: string | { errors: string[] }
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const t0 = performance.now()
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...init,
   })
+  _lastMeta = {
+    requestId: res.headers.get('X-Request-ID') ?? '',
+    durationMs: Math.round(performance.now() - t0),
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw { status: res.status, detail: body.detail } as ApiError

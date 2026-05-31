@@ -1,9 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import {
   adjudicateClaim, denyClaim, fetchClaim, payClaim,
   parseApiError, resubmitClaim, submitClaim, validateClaim,
 } from '../api/claims'
+import { NavBar } from '../components/NavBar'
 import { StatusBadge } from '../components/StatusBadge'
 import type { ClaimDetail as ClaimDetailType } from '../types/claim'
 
@@ -19,10 +20,7 @@ function formatCurrency(n: number | null) {
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(n)
 }
 
-type Action = {
-  label: string
-  handler: () => Promise<ClaimDetailType>
-}
+type Action = { label: string; handler: () => Promise<ClaimDetailType> }
 
 function nextAction(claim: ClaimDetailType): Action | null {
   switch (claim.status) {
@@ -38,10 +36,7 @@ function nextAction(claim: ClaimDetailType): Action | null {
     case 'ADJUDICATED':
       return { label: 'Record Payment →', handler: () => payClaim(claim.id, 130.00) }
     case 'DENIED':
-      return {
-        label: 'Resubmit →',
-        handler: () => resubmitClaim(claim.id, 'Corrected CPT codes and modifiers'),
-      }
+      return { label: 'Resubmit →', handler: () => resubmitClaim(claim.id, 'Corrected CPT codes and modifiers') }
     default:
       return null
   }
@@ -49,10 +44,7 @@ function nextAction(claim: ClaimDetailType): Action | null {
 
 function denyAction(claim: ClaimDetailType): Action | null {
   if (claim.status !== 'ADJUDICATED') return null
-  return {
-    label: 'Deny',
-    handler: () => denyClaim(claim.id, 'CO-97: procedure bundled'),
-  }
+  return { label: 'Deny', handler: () => denyClaim(claim.id, 'CO-97: procedure bundled') }
 }
 
 export function ClaimDetail() {
@@ -61,16 +53,36 @@ export function ClaimDetail() {
   const [claim, setClaim] = useState<ClaimDetailType | null>(null)
   const [working, setWorking] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  function stopPolling() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+  }
 
   useEffect(() => {
-    if (id) fetchClaim(id).then(setClaim).catch(() => setError('Claim not found'))
+    if (id) fetchClaim(id).then(c => { setClaim(c); maybeStartPolling(c) }).catch(() => setError('Claim not found'))
+    return stopPolling
   }, [id])
+
+  function maybeStartPolling(c: ClaimDetailType) {
+    stopPolling()
+    if (c.status === 'SUBMITTING') {
+      pollRef.current = setInterval(() => {
+        fetchClaim(c.id).then(updated => {
+          setClaim(updated)
+          if (updated.status !== 'SUBMITTING') stopPolling()
+        }).catch(() => {})
+      }, 2000)
+    }
+  }
 
   async function run(action: Action) {
     setWorking(true)
     setError(null)
     try {
-      setClaim(await action.handler())
+      const updated = await action.handler()
+      setClaim(updated)
+      maybeStartPolling(updated)
     } catch (e) {
       setError(parseApiError(e))
     } finally {
@@ -80,8 +92,9 @@ export function ClaimDetail() {
 
   if (!claim) {
     return (
-      <div className="min-h-screen bg-gray-50 flex items-center justify-center text-gray-400">
-        {error ?? 'Loading…'}
+      <div className="min-h-screen bg-gray-50">
+        <NavBar />
+        <div className="flex items-center justify-center py-32 text-gray-400">{error ?? 'Loading…'}</div>
       </div>
     )
   }
@@ -89,16 +102,19 @@ export function ClaimDetail() {
   const primary = nextAction(claim)
   const deny = denyAction(claim)
   const hasFinancials = claim.allowed_amount !== null || claim.paid_amount !== null
+  const isSubmitting = claim.status === 'SUBMITTING'
+  const isRejected = claim.status === 'CLEARINGHOUSE_REJECTED'
 
   return (
     <div className="min-h-screen bg-gray-50">
+      <NavBar />
       <div className="max-w-2xl mx-auto px-4 py-10">
 
         <button
-          onClick={() => navigate('/')}
+          onClick={() => navigate('/claims')}
           className="text-sm text-gray-500 hover:text-gray-800 mb-6 flex items-center gap-1 transition-colors"
         >
-          ← Back to claims
+          ← Back to worklist
         </button>
 
         {/* Claim card */}
@@ -140,32 +156,61 @@ export function ClaimDetail() {
           )}
         </div>
 
-        {/* Action buttons */}
-        <div className="flex gap-3 mb-4">
-          {primary ? (
-            <button
-              onClick={() => run(primary)}
-              disabled={working}
-              className="flex-1 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {working ? 'Working…' : primary.label}
-            </button>
-          ) : (
-            <div className="flex-1 py-2.5 rounded-lg text-sm font-medium text-center text-gray-400 bg-gray-100">
-              Claim is {claim.status} — no further transitions
-            </div>
-          )}
+        {/* SUBMITTING in-progress indicator */}
+        {isSubmitting && (
+          <div className="mb-4 bg-amber-50 border border-amber-200 rounded-lg px-4 py-3 flex items-center gap-3">
+            <svg className="animate-spin h-4 w-4 text-amber-600" viewBox="0 0 24 24" fill="none">
+              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+            </svg>
+            <span className="text-sm text-amber-800 font-medium">Processing with clearinghouse…</span>
+          </div>
+        )}
 
-          {deny && (
+        {/* CLEARINGHOUSE_REJECTED alert */}
+        {isRejected && (
+          <div className="mb-4 bg-red-50 border border-red-200 rounded-lg px-4 py-4">
+            <p className="text-sm font-semibold text-red-800 mb-1">Clearinghouse rejection</p>
+            <p className="text-sm text-red-700 mb-3">
+              {claim.events[claim.events.length - 1]?.reason ?? 'EDI validation failed'}
+            </p>
             <button
-              onClick={() => run(deny)}
+              onClick={() => run({ label: 'Retry Submission', handler: () => resubmitClaim(claim.id, 'Resubmitting after clearinghouse rejection') })}
               disabled={working}
-              className="px-4 py-2.5 rounded-lg text-sm font-medium transition-colors bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed"
+              className="px-3 py-1.5 text-sm font-medium bg-red-700 text-white rounded-lg hover:bg-red-800 disabled:opacity-40 transition-colors"
             >
-              Deny
+              Retry Submission →
             </button>
-          )}
-        </div>
+          </div>
+        )}
+
+        {/* Action buttons */}
+        {!isSubmitting && !isRejected && (
+          <div className="flex gap-3 mb-4">
+            {primary ? (
+              <button
+                onClick={() => run(primary)}
+                disabled={working}
+                className="flex-1 py-2.5 rounded-lg text-sm font-medium transition-colors bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                {working ? 'Working…' : primary.label}
+              </button>
+            ) : (
+              <div className="flex-1 py-2.5 rounded-lg text-sm font-medium text-center text-gray-400 bg-gray-100">
+                Claim is {claim.status} — no further transitions
+              </div>
+            )}
+            {deny && (
+              <button
+                onClick={() => run(deny)}
+                disabled={working}
+                className="px-4 py-2.5 rounded-lg text-sm font-medium transition-colors bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Deny
+              </button>
+            )}
+          </div>
+        )}
 
         {error && <p className="mb-4 text-sm text-red-600">{error}</p>}
 
@@ -187,13 +232,17 @@ export function ClaimDetail() {
                     </div>
                     <p className="text-xs text-gray-400 mt-1">{formatDate(event.triggered_at)}</p>
                     {event.reason && <p className="text-xs text-gray-500 mt-1 italic">"{event.reason}"</p>}
+                    {event.idempotency_key && (
+                      <p className="text-xs text-gray-300 mt-1 font-mono" title={event.idempotency_key}>
+                        key: {event.idempotency_key.slice(0, 8)}…
+                      </p>
+                    )}
                   </div>
                 </li>
               ))}
             </ol>
           </div>
         )}
-
       </div>
     </div>
   )

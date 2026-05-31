@@ -22,8 +22,8 @@ _Update this after each build prompt._
 > a simulation that compresses 3 days of billing activity into about 2 minutes — and
 > then walk through what's actually happening while it runs."
 
-**Action:** Click "Start Replay" button on dashboard → amber progress banner appears.
-Banner reads: "Replaying billing activity — Day 1 of 3 · 0 claims · 0 events processed"
+**Action:** Click "⏩ Fast-forward" button on dashboard → amber progress banner appears.
+Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submitted"
 
 ---
 
@@ -48,7 +48,7 @@ Banner reads: "Replaying billing activity — Day 1 of 3 · 0 claims · 0 events
 > 2am can see exactly what the workers are doing, which tasks are failing, and why.
 > That observability matters when you have 22,000 clinicians submitting claims."
 
-**Watch banner:** "Day 1 of 3 · 47 claims · 132 events processed"
+**Watch banner:** "Day 1 of 3 · 47 claims submitted"
 
 ---
 
@@ -100,13 +100,13 @@ Banner reads: "Replaying billing activity — Day 1 of 3 · 0 claims · 0 events
 > But the remittance batch worker I started at the beginning of this recording has
 > been adjudicating live claims at Aetna's real-world rate for 90837."
 
-**Show:** Watch Aetna's bar climb as replay continues — now showing 25-30%
+**Show:** Watch Aetna's bar climb as fast-forward continues — now showing 25-30%. Switch to the CPT code denial rate chart — 90837 is the outlier, 90834 and 90832 are flat.
 
 > "That's not pre-baked into the historical data. The workers introduced it. By
-> the time the replay finishes, you'll see Aetna's 90837 denial rate sitting at
-> 35% — roughly where it sits in the real behavioral health billing market. The
-> analytics surface the pattern automatically. A billing manager looking at this
-> dashboard would know to investigate Aetna 90837 claims."
+> the time the fast-forward finishes, you'll see Aetna's 90837 denial rate sitting at
+> 35% — roughly where it sits in the real behavioral health billing market. The CPT
+> code chart tells you exactly which procedure code is the problem. A billing manager
+> looking at this dashboard would know to investigate Aetna 90837 claims."
 
 ---
 
@@ -164,11 +164,11 @@ Banner reads: "Replaying billing activity — Day 1 of 3 · 0 claims · 0 events
 
 | Segment | Status |
 |---------|--------|
-| Cold open + replay trigger | Pending Phase 2 (replay endpoint) |
-| Flower / queue architecture | Pending Phase 1 complete + docker build |
+| Cold open + fast-forward trigger | ✅ Ready |
+| Flower / queue architecture | ✅ Ready |
 | Rules engine + state machine | ✅ Ready |
 | Idempotency | ✅ Ready |
-| Aetna pattern / analytics charts | Pending Phase 3 (analytics endpoint + dashboard) |
-| Worklist + pagination | Pending Phase 4 |
+| Aetna pattern / analytics charts | ✅ Ready |
+| Worklist + pagination | ✅ Ready |
 | Observability | ✅ Ready |
-| Cold close | Pending public repo |
+| Cold close | ✅ Ready |
