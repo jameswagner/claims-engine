@@ -61,3 +61,47 @@ app.include_router(claims_router)
 app.include_router(remits_router)
 app.include_router(analytics_router)
 app.include_router(demo_router)
+
+from mangum import Mangum  # noqa: E402
+_mangum = Mangum(app)
+
+
+def handler(event, context):
+    task = event.get("task")
+
+    if task == "migrate":
+        import subprocess
+        result = subprocess.run(
+            ["alembic", "upgrade", "head"],
+            capture_output=True,
+            text=True,
+            cwd="/var/task",
+        )
+        log.info("migration_complete", returncode=result.returncode, stdout=result.stdout)
+        return {
+            "task": "migrate",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+
+    if task == "seed":
+        import subprocess
+        cmd = ["python", "seed.py"]
+        if event.get("force"):
+            cmd.append("--force")
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd="/var/task",
+        )
+        log.info("seed_complete", returncode=result.returncode, stdout=result.stdout)
+        return {
+            "task": "seed",
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+        }
+
+    return _mangum(event, context)

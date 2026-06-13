@@ -5,7 +5,7 @@ from sqlalchemy import engine_from_config, pool
 
 from alembic import context
 
-from app.db.session import Base
+from app.db.session import Base, _get_db_url
 import app.models  # noqa: F401 — ensures all models are registered
 
 config = context.config
@@ -15,9 +15,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url from environment so Docker and local both work
-database_url = os.getenv("DATABASE_URL", "postgresql://claims:claims@localhost:5432/claims")
-config.set_main_option("sqlalchemy.url", database_url)
+config.set_main_option("sqlalchemy.url", _get_db_url())
 
 
 def run_migrations_offline() -> None:

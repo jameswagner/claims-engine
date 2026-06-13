@@ -6,33 +6,52 @@ An internal billing operations platform for monitoring and processing insurance 
 
 ## Architecture
 
+**Local development (Docker Compose — 7 services):**
+
 ```
 ┌──────────────────┐    ┌────────────────────────────────────────────┐    ┌─────────────────┐
 │                  │    │  FastAPI  :8000                             │    │                 │
 │  React + Vite    │───▶│  State Machine · Rules Engine              │───▶│   PostgreSQL     │
 │  :5173           │    │  Analytics · Cursor Pagination              │    │   :5432         │
-│                  │    └──────────────────────┬─────────────────────┘    │                 │
-│  /               │                           │ enqueue                   │  claims         │
-│  /claims         │    ┌──────────────────────▼─────────────────────┐    │  claim_events   │
-│  /claims/:id     │    │  Redis  :6379                               │    │  payor_rules    │
-│                  │    └──────────────────────┬─────────────────────┘    │  remits         │
-└──────────────────┘                           │                           └─────────────────┘
+│                  │    └──────────────────────┬─────────────────────┘    └─────────────────┘
+└──────────────────┘                           │ enqueue
                          ┌─────────────────────▼──────────────────────┐
-                         │  Celery Workers                             │
+                         │  Redis  :6379  +  Celery Workers            │
                          │  ┌──────────────┐  ┌──────────────────┐   │
-                         │  │ fast-forward │  │  submission      │   │
-                         │  │ (demo burst  │  │  (clearinghouse  │   │
-                         │  │  firehose)   │  │   EDI handshake) │   │
-                         │  └──────────────┘  └──────────────────┘   │
-                         │  ┌──────────────┐  ┌──────────────────┐   │
-                         │  │  remittance  │  │  Beat scheduler  │   │
-                         │  │  (835 batch  │  │  (10s remittance │   │
-                         │  │   processor) │  │   trigger)       │   │
+                         │  │  submission  │  │  remittance      │   │
+                         │  │  (EDI round- │  │  (835 batch,     │   │
+                         │  │   trip)      │  │   Beat 10s)      │   │
                          │  └──────────────┘  └──────────────────┘   │
                          └────────────────────────────────────────────┘
-
 Flower task monitor: :5555
 ```
+
+**Production (AWS — 5 CDK stacks):**
+
+```
+┌──────────────────────┐    ┌──────────────────────────────────────────────┐    ┌──────────────────┐
+│                      │    │  Lambda  (Docker / Mangum)                    │    │                  │
+│  S3 + CloudFront     │───▶│  API Gateway v2  (HTTP API)                   │───▶│  RDS Postgres 15 │
+│  (Vite bundle)       │    │  State Machine · Rules Engine · Analytics     │    │  t3.micro · VPC  │
+│                      │    └──────────────────────┬───────────────────────┘    └──────────────────┘
+└──────────────────────┘                           │ SQS enqueue
+                              ┌────────────────────▼─────────────────────────┐
+                              │  Lambda Workers                               │
+                              │  ┌───────────────────┐  ┌─────────────────┐  │
+                              │  │  Submission        │  │  Remittance     │  │
+                              │  │  SQS event source  │  │  EventBridge    │  │
+                              │  │  batchSize=1 · DLQ │  │  Scheduler 1m  │  │
+                              │  └───────────────────┘  └─────────────────┘  │
+                              └──────────────────────────────────────────────┘
+```
+
+| CDK Stack | Contents |
+|-----------|----------|
+| `claims-network` | VPC, Lambda + RDS security groups, VPC interface endpoints (Secrets Manager, SQS), Gateway endpoint (DynamoDB) |
+| `claims-data` | RDS Postgres 15, SQS submission queue + DLQ (3 retries, 14-day retention), DynamoDB (FF cursor), Secrets Manager, IAM policies, RDS auto-stop/start schedule |
+| `claims-api` | FastAPI Lambda (Docker/Mangum, 512 MB, 5-min timeout), HTTP API Gateway v2, SSM parameter for frontend URL |
+| `claims-workers` | Submission Lambda (SQS trigger, batchSize=1), Remittance Lambda (EventBridge Scheduler, every 1 min) |
+| `claims-frontend` | S3 bucket, CloudFront distribution, Vite bundle with baked API URL (SSM lookup at synth time) |
 
 **Claim lifecycle:**
 
@@ -54,18 +73,19 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Then seed the database with 6 months of historical baseline claims:
+Then seed the database with 8 days of flat baseline history (t-10 through t-3):
 
 ```bash
 docker exec -w /app claimsprocessing-backend-1 python seed.py
 ```
 
-To compress 3 days of live billing activity into ~2 minutes (fast-forward):
+The fast-forward demo advances the dashboard one day at a time. Each click writes one day of backdated claims with escalating Aetna 90837 denial rates (22% → 36% → 45%), revealing the anomaly across 3 chart updates:
 
 ```bash
-curl -X POST http://localhost:8000/demo/fast-forward
-# poll progress
-curl http://localhost:8000/demo/fast-forward/status
+curl -X POST http://localhost:8000/demo/fast-forward   # day 1: t-2, Aetna 22%
+curl -X POST http://localhost:8000/demo/fast-forward   # day 2: t-1, Aetna 29%
+curl -X POST http://localhost:8000/demo/fast-forward   # day 3: today, Aetna 35%
+curl -X POST http://localhost:8000/demo/fast-forward/reset  # replay from scratch
 ```
 
 | Service      | URL                          |
@@ -101,8 +121,10 @@ cd backend
 | `POST` | `/claims/{id}/remit` | Submit remit (EOB) for an adjudicated claim |
 | `GET` | `/claims/{id}/remit` | Get the remit with all adjustment codes |
 | `GET` | `/analytics/claims` | Denial rates, adjudication timing, aging, throughput by payer |
-| `POST` | `/demo/fast-forward` | Compress 3 days of billing activity into ~2 minutes |
-| `GET` | `/demo/fast-forward/status` | Poll fast-forward progress from Redis |
+| `GET` | `/analytics/denial-rate-timeseries` | Daily denial rate per payer over last 14 days |
+| `POST` | `/demo/fast-forward` | Advance demo by one day (call up to 3×) |
+| `GET` | `/demo/fast-forward/status` | Current demo cursor state from DynamoDB |
+| `POST` | `/demo/fast-forward/reset` | Reset demo cursor for replay |
 
 ---
 
@@ -126,17 +148,19 @@ cd backend
 
 - **Structured logging with per-request tracing.** Every request gets a UUID `request_id` generated at the middleware layer (or propagated from an upstream `X-Request-ID` header) and bound via `structlog.contextvars` so every log line within that request — validation, state machine, DB flush — carries it automatically. Output is pretty console in development, JSON in production (with `EventRenamer` so the message key matches what Datadog and CloudWatch expect). The middleware wraps `call_next` in `try/finally` so request completion is always logged even when a route raises an unhandled exception.
 
-- **Celery + Redis task queue with Beat scheduler.** The clearinghouse submission worker and remittance batch processor run as Celery tasks. The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work asynchronously — the caller gets an immediate 202, the EDI handshake happens in the background. Beat fires the remittance batch processor every 10 seconds so the system continuously adjudicates SUBMITTED claims. Flower provides real-time task monitoring at `:5555`.
+- **SQS + Lambda workers (AWS) / Celery + Redis (local).** The API transitions a claim to SUBMITTING synchronously and enqueues the actual clearinghouse work asynchronously — the caller gets an immediate 202, the EDI handshake happens in the background. In production: the submission Lambda is triggered directly by SQS (batchSize=1, 3 DLQ retries) and the remittance Lambda fires on a one-minute EventBridge Scheduler. Locally: Celery workers consume from Redis with a Beat scheduler every 10 seconds. Flower provides real-time task monitoring at `:5555` in local dev.
 
-- **Fast-forward architecture for demo compression.** `POST /demo/fast-forward` triggers a Celery task that compresses 3 days of billing activity into ~2 minutes — a dumb firehose that creates claims in bursts and drops them into the submission queue. The independent submission worker and Beat-scheduled remittance worker handle everything from there. Progress is tracked in Redis (`demo:fast_forward:status`) and polled by the frontend every 3 seconds to update a live banner. This lets a viewer watch the Aetna denial rate climb in real time rather than seeing a pre-baked chart.
+- **Fast-forward as a rolling demo clock.** The dashboard maintains a `demoCutoff` date, initially set to today − 3, and renders an 8-day window ending there. Each `POST /demo/fast-forward` call writes one day of backdated adjudicated claims directly to the database and returns immediately (~5 seconds). The frontend advances `demoCutoff` by one day and re-fetches the time-series — the chart slides: a new day with higher Aetna denial rates appears on the right, the oldest day drops off the left. Three clicks reveal the full Aetna anomaly. A `POST /demo/fast-forward/reset` clears the DynamoDB cursor so the demo can be replayed. Aetna 90837 denial rates escalate: 22% → 36% → 45% across the three days.
 
-- **Historical seed with deliberate baseline.** The seed script writes 300 historically resolved claims directly to the database with realistic timestamps going back 6 months. Aetna denial rates in the seed are intentionally unremarkable (~15%). The live remittance worker cranks Aetna 90837 to 35% during fast-forward — the anomaly emerges in the analytics charts in real time rather than being pre-loaded.
+- **Seed covers t-10 through t-3 at flat baseline.** The seed script writes 6,400 claims across 8 days (800/day), all at normal denial rates — Aetna 90837 at 15%, other payers 8–12%. Days t-2, t-1, and today are intentionally left empty. The fast-forward fills them one click at a time with escalating Aetna rates, so the anomaly emerges rather than being pre-loaded.
 
 - **Cursor-based pagination on `GET /claims`.** Cursor encodes `(created_at, id)` as base64 JSON. The WHERE clause uses `(created_at, id) < (cursor_created_at, cursor_id)` with `ORDER BY created_at DESC, id DESC` — cost is constant regardless of how deep into the result set you page, unlike offset pagination which degrades as page number grows.
 
 - **Analytics endpoint from the event ledger.** `GET /analytics/claims` aggregates directly from `claim_events` rather than the claims table. This gives accurate time-series metrics: denial rate by payer, denial rate by CPT code, avg days SUBMITTED→ADJUDICATED per payer (using event pairs), aging counts by how long claims have been in SUBMITTED state, throughput in the last 24 hours. The event ledger is the source of truth.
 
-- **What I'd add at scale.** Replace Redis/Celery with SQS and Lambda: workers scale to zero, the DLQ is a first-class AWS primitive, and visibility timeout replaces manual retry logic. ECS Fargate behind an ALB for the API, RDS Aurora with RDS Proxy for connection pooling at scale, S3 + CloudFront for the frontend. OpenTelemetry tracing via X-Ray to stitch together the full lifecycle across services. A dedicated denial classification service that parses remit codes (CO-97, PR-1, etc.) into structured action items for billing teams. Per-payer circuit breakers to handle payer API instability without cascading failures.
+- **What's deployed on AWS.** The app is live on AWS: Lambda (Docker/Mangum) behind HTTP API Gateway v2 for the API, SQS-triggered Lambda for clearinghouse submissions, EventBridge Scheduler for remittance batches, RDS Postgres 15 for the database, S3 + CloudFront for the frontend, DynamoDB for demo cursor state, and Secrets Manager for credentials. All infrastructure is defined in CDK TypeScript across five stacks with cross-stack TypeScript references, IAM managed policies scoped to least privilege, and VPC endpoints routing AWS API calls within the VPC without a NAT gateway.
+
+- **What I'd add next.** A GitHub Actions CI/CD pipeline — run tests on pull requests, `cdk deploy` on merge to main. OpenTelemetry tracing via X-Ray to stitch together the full invocation chain across API Gateway → API Lambda → Worker Lambda. RDS Proxy to cap connection count at scale (each Lambda cold start opens a new connection — fine at low concurrency, breaks at high). A denial classification service that turns remit codes (CO-97, PR-1) into structured action items with priority routing for billing teams. Per-payer circuit breakers to isolate payer API instability. WAF on the API Gateway for production.
 
 ---
 
@@ -146,9 +170,10 @@ cd backend
 |-------|-----------|
 | Frontend | React 18, TypeScript, Vite 6, Tailwind CSS v4, Recharts |
 | Backend | FastAPI, SQLAlchemy 2.0, Alembic, structlog, Python 3.12 |
-| Task queue | Celery 5, Redis 7, Celery Beat, Flower |
-| Database | PostgreSQL 16 |
-| Infrastructure | Docker Compose (6 services) |
+| Task queue | SQS + Lambda + EventBridge Scheduler (AWS) / Celery 5 + Redis 7 + Beat (local) |
+| Database | RDS PostgreSQL 15 (AWS) / PostgreSQL 16 Docker (local) |
+| Demo state | DynamoDB (AWS) / in-memory (local) |
+| Infrastructure | AWS CDK TypeScript — 5 stacks / Docker Compose — 7 services (local) |
 | Testing | pytest |
 
 ---

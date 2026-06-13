@@ -1,0 +1,66 @@
+import json
+import random
+import time
+import uuid
+
+import structlog
+from sqlalchemy import select
+
+from app.claims.exceptions import DuplicateTransitionError
+from app.claims.state_machine import transition
+from app.db.session import SessionLocal
+from app.models.claim import Claim
+from app.models.enums import ClaimStatus
+
+log = structlog.get_logger()
+
+_CLEARINGHOUSE_REJECTION_RATE = 0.20
+_REJECTION_REASON = "EDI validation failed: invalid NPI format"
+
+
+def _process_one(claim_id_str: str, idempotency_key: str) -> dict:
+    db = SessionLocal()
+    try:
+        claim = db.scalar(
+            select(Claim).where(Claim.id == uuid.UUID(claim_id_str)).with_for_update()
+        )
+        if not claim:
+            log.error("submission_claim_not_found", claim_id=claim_id_str)
+            return {"status": "error", "reason": "not_found"}
+
+        if claim.status != ClaimStatus.SUBMITTING:
+            log.warning("submission_wrong_status", claim_id=claim_id_str, status=claim.status.value)
+            return {"status": "skipped", "reason": f"status_is_{claim.status.value}"}
+
+        time.sleep(random.uniform(0.1, 0.3))
+
+        if random.random() < _CLEARINGHOUSE_REJECTION_RATE:
+            transition(claim, ClaimStatus.CLEARINGHOUSE_REJECTED, db,
+                       reason=_REJECTION_REASON, idempotency_key=idempotency_key)
+            outcome = "clearinghouse_rejected"
+        else:
+            transition(claim, ClaimStatus.SUBMITTED, db, idempotency_key=idempotency_key)
+            outcome = "submitted"
+
+        db.commit()
+        log.info("submission_processed", claim_id=claim_id_str, outcome=outcome)
+        return {"status": outcome, "claim_id": claim_id_str}
+
+    except DuplicateTransitionError:
+        log.info("submission_already_processed", claim_id=claim_id_str)
+        return {"status": "already_processed", "claim_id": claim_id_str}
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def handler(event, context):
+    # SQS trigger — event["Records"] is a list of messages
+    results = []
+    for record in event.get("Records", []):
+        body = json.loads(record["body"])
+        result = _process_one(body["claim_id"], body["idempotency_key"])
+        results.append(result)
+    return {"processed": len(results), "results": results}

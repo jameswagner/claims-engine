@@ -1,9 +1,11 @@
+import types
 import uuid
 from decimal import Decimal
 from unittest.mock import patch
 
 import pytest
 
+from app.claims.state_machine import TransitionResult
 from app.models.enums import ClaimStatus
 from tests.conftest import make_claim
 
@@ -33,8 +35,9 @@ def _stamp(obj):
 # ---------------------------------------------------------------------------
 
 def test_create_claim_returns_201(client, db):
+    db.scalar.return_value = None
     db.refresh.side_effect = _stamp
-    response = client.post("/claims", json=VALID_CLAIM_BODY)
+    response = client.post("/claims", json=VALID_CLAIM_BODY, headers=IK)
     assert response.status_code == 201
     assert response.json()["status"] == "CREATED"
     assert response.json()["billed_amount"] == 200.0
@@ -42,12 +45,13 @@ def test_create_claim_returns_201(client, db):
 
 def test_create_claim_missing_billed_amount_returns_422(client, db):
     body = {k: v for k, v in VALID_CLAIM_BODY.items() if k != "billed_amount"}
-    assert client.post("/claims", json=body).status_code == 422
+    assert client.post("/claims", json=body, headers=IK).status_code == 422
 
 
 def test_create_claim_commits_to_db(client, db):
+    db.scalar.return_value = None
     db.refresh.side_effect = _stamp
-    client.post("/claims", json=VALID_CLAIM_BODY)
+    client.post("/claims", json=VALID_CLAIM_BODY, headers=IK)
     db.commit.assert_called_once()
 
 
@@ -88,11 +92,26 @@ def test_validate_requires_idempotency_key(client, db):
     assert client.post(f"/claims/{uuid.uuid4()}/validate").status_code == 422
 
 
+def test_create_claim_requires_idempotency_key(client, db):
+    body = VALID_CLAIM_BODY
+    assert client.post("/claims", json=body).status_code == 422
+
+
+def test_create_claim_replays_on_duplicate_idempotency_key(client, db):
+    claim = make_claim()
+    event = types.SimpleNamespace(claim=claim)
+    db.scalar.return_value = event
+
+    response = client.post("/claims", json=VALID_CLAIM_BODY, headers=IK)
+    assert response.status_code == 201
+    assert response.json()["id"] == str(claim.id)
+
+
 @patch("app.api.claims.transition")
 def test_validate_success(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.CREATED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     response = client.post(f"/claims/{claim.id}/validate", headers=IK)
     assert response.status_code == 200
     assert response.json()["status"] == "VALIDATED"
@@ -123,7 +142,7 @@ def test_validate_rules_failure_returns_422(mock_t, client, db):
 def test_submit_success(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.VALIDATED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     response = client.post(f"/claims/{claim.id}/submit", json={}, headers=IK)
     assert response.status_code == 202
     assert response.json()["status"] == "SUBMITTING"
@@ -135,7 +154,7 @@ def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_delay, client, d
     claim = make_claim(status=ClaimStatus.VALIDATED)
     db.scalar.return_value = claim
     calls = []
-    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: (calls.append(kw.get("reason")) or setattr(c, "status", s)) or TransitionResult(None, False)
     client.post(f"/claims/{claim.id}/submit", json={"clearinghouse_ref": "CH-12345"}, headers=IK)
     assert calls[0] == "CH-12345"
 
@@ -148,7 +167,7 @@ def test_submit_passes_clearinghouse_ref_as_reason(mock_t, mock_delay, client, d
 def test_adjudicate_success(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.SUBMITTED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     body = {"allowed_amount": 150.00, "patient_responsibility": 20.00}
     response = client.post(f"/claims/{claim.id}/adjudicate", json=body, headers=IK)
     assert response.status_code == 200
@@ -159,7 +178,7 @@ def test_adjudicate_success(mock_t, client, db):
 def test_adjudicate_sets_financial_fields(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.SUBMITTED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     body = {"allowed_amount": 150.00, "patient_responsibility": 20.00, "adjustment_reason": "CO-45"}
     client.post(f"/claims/{claim.id}/adjudicate", json=body, headers=IK)
     assert claim.allowed_amount == Decimal("150.00")
@@ -180,7 +199,7 @@ def test_adjudicate_missing_allowed_amount_returns_422(client, db):
 def test_pay_success(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.ADJUDICATED, allowed_amount=Decimal("150"))
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     response = client.post(f"/claims/{claim.id}/pay", json={"paid_amount": 130.00}, headers=IK)
     assert response.status_code == 200
     assert response.json()["status"] == "PAID"
@@ -190,7 +209,7 @@ def test_pay_success(mock_t, client, db):
 def test_pay_sets_paid_amount(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     client.post(f"/claims/{claim.id}/pay", json={"paid_amount": 130.00}, headers=IK)
     assert claim.paid_amount == Decimal("130.00")
 
@@ -207,7 +226,7 @@ def test_pay_missing_paid_amount_returns_422(client, db):
 def test_deny_success(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     response = client.post(f"/claims/{claim.id}/deny", json={"denial_reason": "CO-97"}, headers=IK)
     assert response.status_code == 200
     assert response.json()["status"] == "DENIED"
@@ -218,7 +237,7 @@ def test_deny_passes_reason_to_transition(mock_t, client, db):
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
     db.scalar.return_value = claim
     calls = []
-    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: (calls.append(kw.get("reason")) or setattr(c, "status", s)) or TransitionResult(None, False)
     client.post(f"/claims/{claim.id}/deny", json={"denial_reason": "CO-97: bundled"}, headers=IK)
     assert calls[0] == "CO-97: bundled"
 
@@ -236,7 +255,7 @@ def test_deny_missing_reason_returns_422(client, db):
 def test_resubmit_success(mock_t, mock_delay, client, db):
     claim = make_claim(status=ClaimStatus.DENIED)
     db.scalar.return_value = claim
-    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: setattr(c, "status", s) or TransitionResult(None, False)
     body = {"correction_notes": "Added modifier HO"}
     response = client.post(f"/claims/{claim.id}/resubmit", json=body, headers=IK)
     assert response.status_code == 202
@@ -249,7 +268,7 @@ def test_resubmit_passes_correction_notes_as_reason(mock_t, mock_delay, client, 
     claim = make_claim(status=ClaimStatus.DENIED)
     db.scalar.return_value = claim
     calls = []
-    mock_t.side_effect = lambda c, s, db, **kw: calls.append(kw.get("reason")) or setattr(c, "status", s)
+    mock_t.side_effect = lambda c, s, db, **kw: (calls.append(kw.get("reason")) or setattr(c, "status", s)) or TransitionResult(None, False)
     client.post(f"/claims/{claim.id}/resubmit", json={"correction_notes": "Fixed modifier"}, headers=IK)
     assert calls[0] == "Fixed modifier"
 
@@ -263,10 +282,19 @@ def test_resubmit_missing_correction_notes_returns_422(client, db):
 # ---------------------------------------------------------------------------
 
 @patch("app.api.claims.transition")
-def test_duplicate_idempotency_key_returns_200_replay(mock_t, client, db):
+def test_duplicate_idempotency_key_conflict_returns_409(mock_t, client, db):
     from app.claims.exceptions import DuplicateTransitionError
     claim = make_claim(status=ClaimStatus.VALIDATED)
     db.scalar.return_value = claim
-    mock_t.side_effect = DuplicateTransitionError("already done")
+    mock_t.side_effect = DuplicateTransitionError("key used for a different transition")
+    response = client.post(f"/claims/{claim.id}/validate", headers=IK)
+    assert response.status_code == 409
+
+
+@patch("app.api.claims.transition")
+def test_transition_replay_returns_200(mock_t, client, db):
+    claim = make_claim(status=ClaimStatus.VALIDATED)
+    db.scalar.return_value = claim
+    mock_t.return_value = TransitionResult(None, True)
     response = client.post(f"/claims/{claim.id}/validate", headers=IK)
     assert response.status_code == 200

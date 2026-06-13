@@ -9,3 +9,6 @@ dist/
 CLAIMS_101.md
 PLAN.md
 backend/celerybeat-schedule
+JOB_DESCRIPTION.md
+CLOUD_MIGRATION.md
+DIAGRAMS.md

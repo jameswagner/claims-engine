@@ -1,8 +1,8 @@
-import { useEffect, useState } from 'react'
-import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { fetchAnalytics, fetchFastForwardStatus, startFastForward } from '../api/analytics'
+import { useEffect, useRef, useState } from 'react'
+import { Bar, BarChart, Cell, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
+import { fetchAnalytics, fetchDenialRateTimeseries, resetFastForward, stepFastForward } from '../api/analytics'
 import { NavBar } from '../components/NavBar'
-import type { ClaimsAnalytics, FastForwardStatus } from '../types/claim'
+import type { ClaimsAnalytics, DenialRateDailyPoint } from '../types/claim'
 
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
@@ -12,6 +12,14 @@ function MetricCard({ label, value, sub }: { label: string; value: string | numb
       {sub && <p className="text-xs text-gray-400 mt-1">{sub}</p>}
     </div>
   )
+}
+
+const PAYER_COLORS: Record<string, string> = {
+  Aetna: '#dc2626',
+  BCBS: '#6366f1',
+  Cigna: '#0ea5e9',
+  UnitedHealthcare: '#10b981',
+  Humana: '#f59e0b',
 }
 
 function denialColor(rate: number): string {
@@ -26,31 +34,67 @@ function secondsAgo(d: Date) {
   return s < 60 ? `${s}s ago` : `${Math.floor(s / 60)}m ago`
 }
 
+function isoDate(d: Date): string {
+  return d.toISOString().slice(0, 10)
+}
+
+function addDays(d: Date, n: number): Date {
+  const r = new Date(d)
+  r.setDate(r.getDate() + n)
+  return r
+}
+
+function buildTimeseriesChartData(points: DenialRateDailyPoint[], cutoff: Date) {
+  // Show 8-day window ending at cutoff
+  const windowStart = isoDate(addDays(cutoff, -7))
+  const windowEnd = isoDate(cutoff)
+
+  const visible = points.filter(p => p.date >= windowStart && p.date <= windowEnd)
+  const days = [...new Set(visible.map(p => p.date))].sort()
+  const payers = [...new Set(visible.map(p => p.payer))].sort()
+
+  const chartData = days.map(date => {
+    const row: Record<string, string | number | null> = { date: date.slice(5).replace('-', '/') }
+    for (const payer of payers) {
+      const pt = visible.find(p => p.date === date && p.payer === payer)
+      row[payer] = pt?.denial_rate_pct ?? null
+    }
+    return row
+  })
+
+  return { chartData, payers }
+}
+
 export function Dashboard() {
   const [analytics, setAnalytics] = useState<ClaimsAnalytics | null>(null)
-  const [fastForward, setFastForward] = useState<FastForwardStatus>({ running: false, day: 0, total_days: 0, claims_created: 0 })
-  const [dismissed, setDismissed] = useState(false)
+  const [timeseries, setTimeseries] = useState<DenialRateDailyPoint[] | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [, setTick] = useState(0)
-  const [launching, setLaunching] = useState(false)
-  const [fastForwardError, setFastForwardError] = useState<string | null>(null)
+
+  // Demo clock: starts 3 days in the past, advances one day per FF click
+  const [demoCutoff, setDemoCutoff] = useState<Date>(() => addDays(new Date(), -3))
+  const [ffDayIndex, setFfDayIndex] = useState(0)
+  const [ffStepping, setFfStepping] = useState(false)
+  const [ffError, setFfError] = useState<string | null>(null)
+  const ffSteppingRef = useRef(false)
 
   useEffect(() => {
-    const load = () => fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }).catch(() => {})
+    const load = () => {
+      if (ffSteppingRef.current) return Promise.resolve()
+      return Promise.all([
+        fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
+        fetchDenialRateTimeseries().then(setTimeseries),
+      ]).catch(() => {})
+    }
+    // Sync FF cursor from backend so page refresh shows correct button state
+    import('../api/analytics').then(({ fetchFastForwardStatus }) =>
+      fetchFastForwardStatus().then(s => {
+        setFfDayIndex(s.day)
+        setDemoCutoff(addDays(new Date(), -(3 - s.day)))
+      }).catch(() => {})
+    )
     load()
     const id = setInterval(load, 20_000)
-    return () => clearInterval(id)
-  }, [])
-
-  useEffect(() => {
-    const poll = () => fetchFastForwardStatus().then(r => {
-      setFastForward(prev => {
-        if (r.running && !prev.running) setDismissed(false)
-        return r
-      })
-    }).catch(() => {})
-    poll()
-    const id = setInterval(poll, 3_000)
     return () => clearInterval(id)
   }, [])
 
@@ -59,20 +103,44 @@ export function Dashboard() {
     return () => clearInterval(id)
   }, [])
 
-  async function handleStartFastForward() {
-    setLaunching(true)
-    setFastForwardError(null)
+  async function handleStepFastForward() {
+    ffSteppingRef.current = true
+    setFfStepping(true)
+    setFfError(null)
     try {
-      await startFastForward()
-      setDismissed(false)
+      const result = await stepFastForward()
+      setFfDayIndex(result.day_index)
+      // Advance the demo clock by one day
+      setDemoCutoff(prev => addDays(prev, 1))
+      // Refresh chart data immediately
+      await Promise.all([
+        fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
+        fetchDenialRateTimeseries().then(setTimeseries),
+      ])
     } catch (e: unknown) {
-      setFastForwardError(e instanceof Error ? e.message : 'Failed to start fast-forward')
+      setFfError(e instanceof Error ? e.message : 'Failed')
     } finally {
-      setLaunching(false)
+      ffSteppingRef.current = false
+      setFfStepping(false)
     }
   }
 
-  const showBanner = fastForward.running && !dismissed
+  async function handleReset() {
+    try {
+      await resetFastForward()
+      setFfDayIndex(0)
+      setDemoCutoff(addDays(new Date(), -3))
+      setFfError(null)
+      await Promise.all([
+        fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
+        fetchDenialRateTimeseries().then(setTimeseries),
+      ])
+    } catch {
+      // ignore
+    }
+  }
+
+  const ffComplete = ffDayIndex >= 3
   const totalClaims = analytics
     ? Object.values(analytics.claims_by_status).reduce((a, b) => a + b, 0)
     : null
@@ -90,28 +158,13 @@ export function Dashboard() {
       ).toFixed(1)
     : null
 
+  const { chartData, payers } = timeseries
+    ? buildTimeseriesChartData(timeseries, demoCutoff)
+    : { chartData: [], payers: [] }
+
   return (
     <div className="min-h-screen bg-gray-50">
       <NavBar />
-
-      {/* Fast-forward banner */}
-      {showBanner && (
-        <div className="bg-amber-50 border-b border-amber-200 px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse inline-block" />
-            <span className="text-sm text-amber-800 font-medium">
-              Fast-forwarding billing activity — Day {fastForward.day} of {fastForward.total_days} · {fastForward.claims_created} claims submitted
-            </span>
-            <div className="w-32 bg-amber-200 rounded-full h-1.5">
-              <div
-                className="bg-amber-500 h-1.5 rounded-full transition-all"
-                style={{ width: `${fastForward.total_days ? (fastForward.day / fastForward.total_days) * 100 : 0}%` }}
-              />
-            </div>
-          </div>
-          <button onClick={() => setDismissed(true)} className="text-amber-500 hover:text-amber-700 text-sm ml-4">✕</button>
-        </div>
-      )}
 
       <div className="max-w-6xl mx-auto px-6 py-8">
 
@@ -119,17 +172,32 @@ export function Dashboard() {
         <div className="flex items-center justify-between mb-8">
           <div>
             <h1 className="text-xl font-bold text-gray-900">Claims Dashboard</h1>
-            <p className="text-sm text-gray-400 mt-0.5">Network-wide billing activity</p>
+            <p className="text-sm text-gray-400 mt-0.5">
+              Showing data through <span className="font-medium text-gray-600">{isoDate(demoCutoff)}</span>
+            </p>
           </div>
           <div className="flex items-center gap-3">
-            {fastForwardError && <span className="text-xs text-red-600">{fastForwardError}</span>}
-            <button
-              onClick={handleStartFastForward}
-              disabled={launching || fastForward.running}
-              className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-            >
-              {fastForward.running ? 'Fast-forwarding…' : launching ? 'Starting…' : '⏩ Fast-forward'}
-            </button>
+            {ffError && <span className="text-xs text-red-600">{ffError}</span>}
+            {ffComplete ? (
+              <button
+                onClick={handleReset}
+                className="px-4 py-2 bg-gray-100 text-gray-700 text-sm font-medium rounded-lg hover:bg-gray-200 transition-colors"
+              >
+                ↺ Reset demo
+              </button>
+            ) : (
+              <button
+                onClick={handleStepFastForward}
+                disabled={ffStepping}
+                className="px-4 py-2 bg-indigo-600 text-white text-sm font-medium rounded-lg hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+              >
+                {ffStepping
+                  ? `Writing day ${ffDayIndex + 1}…`
+                  : ffDayIndex === 0
+                    ? '⏩ Advance one day'
+                    : `⏩ Advance to ${isoDate(addDays(demoCutoff, 1))} (${ffDayIndex + 1}/3)`}
+              </button>
+            )}
           </div>
         </div>
 
@@ -149,7 +217,7 @@ export function Dashboard() {
           <MetricCard
             label="Claims last 24h"
             value={analytics?.throughput_last_24h.created ?? '—'}
-            sub="new claims created"
+            sub="resolved (paid or denied)"
           />
           <MetricCard
             label="Network denial rate"
@@ -171,24 +239,35 @@ export function Dashboard() {
         {/* Charts */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
 
-          {/* Denial rate by payer */}
-          <div className="bg-white rounded-xl border border-gray-200 p-6">
-            <h2 className="text-sm font-semibold text-gray-700 mb-4">Denial Rate by Payer</h2>
-            {analytics?.denial_rate_by_payer.length ? (
-              <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={analytics.denial_rate_by_payer} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
-                  <XAxis dataKey="payer" tick={{ fontSize: 11 }} />
+          {/* Denial rate trend — full width */}
+          <div className="lg:col-span-2 bg-white rounded-xl border border-gray-200 p-6">
+            <h2 className="text-sm font-semibold text-gray-700 mb-0.5">Denial Rate by Payer — 8-Day Trend</h2>
+            <p className="text-xs text-gray-400 mb-4">% of adjudicated claims denied per day · through {isoDate(demoCutoff)}</p>
+            {chartData.length > 0 ? (
+              <ResponsiveContainer width="100%" height={240}>
+                <LineChart data={chartData} margin={{ top: 4, right: 16, left: -16, bottom: 0 }}>
+                  <XAxis dataKey="date" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} domain={[0, 'auto']} />
-                  <Tooltip formatter={(v: number | string) => [`${Number(v).toFixed(1)}%`, 'Denial rate']} />
-                  <Bar dataKey="denial_rate_pct" radius={[4, 4, 0, 0]}>
-                    {analytics.denial_rate_by_payer.map((entry, i) => (
-                      <Cell key={i} fill={denialColor(entry.denial_rate_pct)} />
-                    ))}
-                  </Bar>
-                </BarChart>
+                  <Tooltip formatter={(v) => [`${Number(v ?? 0).toFixed(1)}%`, '']} />
+                  <ReferenceLine y={20} stroke="#f97316" strokeDasharray="4 3" label={{ value: 'Alert threshold (20%)', position: 'insideTopRight', fontSize: 11, fill: '#f97316' }} />
+                  <Legend wrapperStyle={{ fontSize: 12 }} />
+                  {payers.map(payer => (
+                    <Line
+                      key={payer}
+                      type="monotone"
+                      dataKey={payer}
+                      stroke={PAYER_COLORS[payer] ?? '#9ca3af'}
+                      strokeWidth={payer === 'Aetna' ? 2.5 : 1.5}
+                      dot={{ r: 3 }}
+                      connectNulls
+                    />
+                  ))}
+                </LineChart>
               </ResponsiveContainer>
             ) : (
-              <div className="h-[220px] flex items-center justify-center text-gray-400 text-sm">Loading…</div>
+              <div className="h-[240px] flex items-center justify-center text-gray-400 text-sm">
+                {timeseries === null ? 'Loading…' : 'No data in window'}
+              </div>
             )}
           </div>
 
@@ -200,7 +279,7 @@ export function Dashboard() {
                 <BarChart data={analytics.denial_rate_by_cpt} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
                   <XAxis dataKey="cpt_code" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} domain={[0, 'auto']} />
-                  <Tooltip formatter={(v: number | string) => [`${Number(v).toFixed(1)}%`, 'Denial rate']} />
+                  <Tooltip formatter={(v) => [`${Number(v ?? 0).toFixed(1)}%`, 'Denial rate']} />
                   <Bar dataKey="denial_rate_pct" radius={[4, 4, 0, 0]}>
                     {analytics.denial_rate_by_cpt.map((entry, i) => (
                       <Cell key={i} fill={denialColor(entry.denial_rate_pct)} />
@@ -221,7 +300,7 @@ export function Dashboard() {
                 <BarChart data={analytics.avg_days_to_adjudication_by_payer} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
                   <XAxis dataKey="payer" tick={{ fontSize: 11 }} />
                   <YAxis tick={{ fontSize: 11 }} tickFormatter={v => `${v}d`} domain={[0, 'auto']} />
-                  <Tooltip formatter={(v: number | string) => [`${Number(v).toFixed(1)} days`, 'Avg days']} />
+                  <Tooltip formatter={(v) => [`${Number(v ?? 0).toFixed(1)} days`, 'Avg days']} />
                   <Bar dataKey="avg_days" fill="#6366f1" radius={[4, 4, 0, 0]} />
                 </BarChart>
               </ResponsiveContainer>

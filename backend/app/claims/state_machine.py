@@ -1,7 +1,9 @@
 import time
+from dataclasses import dataclass
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.claims.exceptions import (
@@ -28,13 +30,19 @@ ALLOWED_TRANSITIONS: dict[ClaimStatus, frozenset[ClaimStatus]] = {
 log = structlog.get_logger()
 
 
+@dataclass
+class TransitionResult:
+    event: ClaimEvent | None
+    is_replay: bool
+
+
 def transition(
     claim: Claim,
     to_status: ClaimStatus,
     db: Session,
     reason: str | None = None,
     idempotency_key: str | None = None,
-) -> ClaimEvent:
+) -> TransitionResult:
     start = time.perf_counter()
     from_status = claim.status
 
@@ -51,18 +59,27 @@ def transition(
         )
 
     if idempotency_key is not None:
-        if db.scalar(select(ClaimEvent).where(ClaimEvent.idempotency_key == idempotency_key)):
-            log.warning(
-                "transition_rejected",
-                claim_id=str(claim.id),
-                from_status=from_status.value,
-                to_status=to_status.value,
-                reason="duplicate_idempotency_key",
-                idempotency_key=idempotency_key,
-            )
-            raise DuplicateTransitionError(
-                f"Transition to {to_status.value} already recorded for claim {claim.id}"
-            )
+        existing_event = db.scalar(
+            select(ClaimEvent).where(ClaimEvent.idempotency_key == idempotency_key)
+        )
+        if existing_event:
+            if (
+                existing_event.claim_id != claim.id
+                or existing_event.from_status != from_status
+                or existing_event.to_status != to_status
+            ):
+                log.warning(
+                    "transition_rejected",
+                    claim_id=str(claim.id),
+                    from_status=from_status.value,
+                    to_status=to_status.value,
+                    reason="duplicate_idempotency_key_mismatch",
+                    idempotency_key=idempotency_key,
+                )
+                raise DuplicateTransitionError(
+                    f"Idempotency key {idempotency_key} was used for a different transition"
+                )
+            return TransitionResult(existing_event, True)
 
     if from_status == ClaimStatus.CREATED and to_status == ClaimStatus.VALIDATED:
         result = validate_claim(
@@ -94,8 +111,18 @@ def transition(
         idempotency_key=idempotency_key,
     )
     db.add(event)
+    try:
+        db.flush()
+    except IntegrityError:
+        db.rollback()
+        existing_event = db.scalar(
+            select(ClaimEvent).where(ClaimEvent.idempotency_key == idempotency_key)
+        )
+        if existing_event:
+            return TransitionResult(existing_event, True)
+        raise
+
     claim.status = to_status
-    db.flush()
 
     duration_ms = round((time.perf_counter() - start) * 1000, 1)
     log.info(
@@ -108,4 +135,4 @@ def transition(
         duration_ms=duration_ms,
     )
 
-    return event
+    return TransitionResult(event, False)

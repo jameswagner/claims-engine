@@ -1,0 +1,7 @@
+{
+  "availability-zones:account=094573088890:region=us-west-1": [
+    "us-west-1b",
+    "us-west-1c"
+  ],
+  "ssm:account=094573088890:parameterName=/claims/api-url:region=us-west-1": "https://jqftpa39m8.execute-api.us-west-1.amazonaws.com"
+}

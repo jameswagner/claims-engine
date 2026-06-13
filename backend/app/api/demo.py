@@ -1,42 +1,54 @@
-import json
-import os
-
-import redis
 import structlog
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.tasks.fast_forward import FAST_FORWARD_KEY, run_fast_forward
+from app.tasks.fast_forward import (
+    advance_one_day,
+    get_cursor,
+    get_ff_status,
+    reset_cursor,
+)
 
 router = APIRouter(prefix="/demo", tags=["demo"])
 log = structlog.get_logger()
-
-_redis = redis.from_url(os.environ.get("REDIS_URL", "redis://localhost:6379/0"))
 
 
 class FastForwardStatus(BaseModel):
     running: bool
     day: int = 0
-    total_days: int = 0
+    total_days: int = 3
     claims_created: int = 0
 
 
-@router.post("/fast-forward", status_code=202)
-def start_fast_forward():
-    raw = _redis.get(FAST_FORWARD_KEY)
-    if raw:
-        status = json.loads(raw)
-        if status.get("running"):
-            raise HTTPException(status_code=409, detail="Fast-forward already running")
+class FastForwardResult(BaseModel):
+    day_index: int
+    date_written: str | None
+    complete: bool
 
-    run_fast_forward.delay()
-    log.info("fast_forward_triggered")
-    return {"message": "Fast-forward started"}
+
+@router.post("/fast-forward", response_model=FastForwardResult, status_code=202)
+def step_fast_forward():
+    """Advance the demo by one day. Call up to 3 times to reveal the Aetna anomaly."""
+    cursor = get_cursor()
+    if cursor >= 3:
+        raise HTTPException(status_code=409, detail="Fast-forward complete — reset first")
+
+    result = advance_one_day()
+    log.info("fast_forward_step", **result)
+    return FastForwardResult(**result)
 
 
 @router.get("/fast-forward/status", response_model=FastForwardStatus)
 def get_fast_forward_status():
-    raw = _redis.get(FAST_FORWARD_KEY)
-    if not raw:
+    status = get_ff_status()
+    if not status:
         return FastForwardStatus(running=False)
-    return FastForwardStatus(**json.loads(raw))
+    return FastForwardStatus(**status)
+
+
+@router.post("/fast-forward/reset", status_code=200)
+def reset_fast_forward():
+    """Reset the demo cursor so fast-forward can be replayed from scratch."""
+    reset_cursor()
+    log.info("fast_forward_reset")
+    return {"message": "Fast-forward reset"}

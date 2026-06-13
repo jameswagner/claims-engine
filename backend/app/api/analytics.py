@@ -5,13 +5,14 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, cast, Date
 from sqlalchemy.orm import Session
 
 from app.db.session import get_db
 from app.models.claim import Claim
 from app.models.claim_event import ClaimEvent
 from app.models.enums import ClaimStatus
+from app.tasks.fast_forward import get_demo_now
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 log = structlog.get_logger()
@@ -49,6 +50,14 @@ class Throughput24h(BaseModel):
 
 class CptDenialRate(BaseModel):
     cpt_code: str
+    total: int
+    denied: int
+    denial_rate_pct: float
+
+
+class DenialRateDailyPoint(BaseModel):
+    date: str
+    payer: str
     total: int
     denied: int
     denial_rate_pct: float
@@ -141,9 +150,11 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
     ]
 
     # --- Avg days to adjudication by payer ---
-    # Join SUBMITTED events with ADJUDICATED events for the same claim
+    # Scoped to the current demo day so the number reflects today's batch, not the
+    # all-time average (which is locked by the deterministic seed and never moves).
     e_sub = ClaimEvent.__table__.alias("e_sub")
     e_adj = ClaimEvent.__table__.alias("e_adj")
+    demo_day_start = get_demo_now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     adj_days_rows = db.execute(
         select(
@@ -157,6 +168,7 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
         .join(Claim, Claim.id == e_sub.c.claim_id)
         .where(e_sub.c.to_status == ClaimStatus.SUBMITTED.value)
         .where(e_adj.c.to_status == ClaimStatus.ADJUDICATED.value)
+        .where(e_adj.c.triggered_at >= demo_day_start)
         .group_by(Claim.insurance_payer)
     ).all()
 
@@ -166,7 +178,7 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
     ]
 
     # --- Aging summary ---
-    now = datetime.now(timezone.utc)
+    now = get_demo_now()
     threshold_14 = now - timedelta(days=14)
     threshold_30 = now - timedelta(days=30)
 
@@ -225,7 +237,8 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
     )
 
     # --- Throughput last 24h ---
-    since = now - timedelta(hours=24)
+    # Use start of the current demo day so the window = "today" not a rolling 24h that spans two batch days.
+    since = get_demo_now().replace(hour=0, minute=0, second=0, microsecond=0)
 
     def _count_events(to_status: ClaimStatus) -> int:
         return db.scalar(
@@ -234,8 +247,14 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
             .where(ClaimEvent.triggered_at >= since)
         ) or 0
 
+    resolved_today = db.scalar(
+        select(func.count(func.distinct(ClaimEvent.claim_id)))
+        .where(ClaimEvent.to_status.in_([ClaimStatus.PAID, ClaimStatus.DENIED]))
+        .where(ClaimEvent.triggered_at >= since)
+    ) or 0
+
     throughput = Throughput24h(
-        created=_count_events(ClaimStatus.VALIDATED),
+        created=resolved_today,
         submitted=_count_events(ClaimStatus.SUBMITTED),
         paid=_count_events(ClaimStatus.PAID),
         denied=_count_events(ClaimStatus.DENIED),
@@ -253,3 +272,46 @@ def get_claims_analytics(db: Session = Depends(get_db)) -> Any:
         resubmission_success_rate=resubmission_rate,
         throughput_last_24h=throughput,
     )
+
+
+@router.get("/denial-rate-timeseries", response_model=list[DenialRateDailyPoint])
+def get_denial_rate_timeseries(db: Session = Depends(get_db)) -> Any:
+    since = get_demo_now() - timedelta(days=14)
+
+    date_expr = func.date_trunc("day", ClaimEvent.triggered_at)
+
+    rows = db.execute(
+        select(
+            date_expr.label("event_day"),
+            Claim.insurance_payer,
+            ClaimEvent.to_status,
+            func.count().label("n"),
+        )
+        .join(Claim, Claim.id == ClaimEvent.claim_id)
+        .where(ClaimEvent.from_status == ClaimStatus.ADJUDICATED)
+        .where(ClaimEvent.to_status.in_([ClaimStatus.PAID, ClaimStatus.DENIED]))
+        .where(ClaimEvent.triggered_at >= since)
+        .group_by(date_expr, Claim.insurance_payer, ClaimEvent.to_status)
+        .order_by(date_expr, Claim.insurance_payer)
+    ).all()
+
+    points: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        date_str = row.event_day.strftime("%Y-%m-%d")
+        key = (date_str, row.insurance_payer)
+        if key not in points:
+            points[key] = {"total": 0, "denied": 0}
+        points[key]["total"] += row.n
+        if row.to_status == ClaimStatus.DENIED:
+            points[key]["denied"] += row.n
+
+    return [
+        DenialRateDailyPoint(
+            date=k[0],
+            payer=k[1],
+            total=v["total"],
+            denied=v["denied"],
+            denial_rate_pct=round(v["denied"] / v["total"] * 100, 1) if v["total"] else 0.0,
+        )
+        for k, v in sorted(points.items())
+    ]

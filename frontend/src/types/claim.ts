@@ -67,9 +67,23 @@ export interface ClaimsAnalytics {
   throughput_last_24h: { created: number; submitted: number; paid: number; denied: number }
 }
 
+export interface DenialRateDailyPoint {
+  date: string
+  payer: string
+  total: number
+  denied: number
+  denial_rate_pct: number
+}
+
 export interface FastForwardStatus {
   running: boolean
   day: number
   total_days: number
   claims_created: number
+}
+
+export interface FastForwardResult {
+  day_index: number
+  date_written: string | null
+  complete: boolean
 }

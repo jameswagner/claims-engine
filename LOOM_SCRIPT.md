@@ -8,48 +8,65 @@ _Update this after each build prompt._
 
 ## BEFORE YOU HIT RECORD
 
-1. `docker compose up` — all 6 services healthy (db, redis, backend, worker, beat, flower)
+**Option A — Live AWS demo (recommended for showing cloud architecture)**
+
+1. Open the CloudFront URL (production dashboard)
+2. Confirm dashboard shows 8-day flat baseline — all payer denial rates below 20% threshold
+3. If fast-forward has already been advanced: `POST /demo/fast-forward/reset` first
+4. If data looks stale or reset is needed: invoke the seed Lambda via AWS Console or CLI
+5. Open tabs: CloudFront dashboard, API Gateway URL + `/docs`
+
+**Option B — Local Docker demo (for Flower/worker observability segment)**
+
+1. `docker compose up` — all 7 services healthy (db, redis, backend, worker, beat, flower, frontend)
 2. Run seed: `docker exec -w /app claimsprocessing-backend-1 python seed.py`
-3. Open tabs: `localhost:5173` (dashboard), `localhost:5555` (Flower), `localhost:8000/docs` (API)
-4. Dashboard should show ~300 historical claims, charts populated, all Aetna denial rates ~15%
+3. If rerunning: `TRUNCATE claims CASCADE;` first, then seed again; also `POST /demo/fast-forward/reset`
+4. Open tabs: `localhost:5173` (dashboard), `localhost:5555` (Flower), `localhost:8000/docs` (API)
+5. Dashboard should show 8-day denial rate trend chart — all payer lines flat, all below the 20% alert threshold.
 
 ---
 
-## COLD OPEN (15 seconds)
+## COLD OPEN (20 seconds)
 
-> "This is Grow Therapy's internal billing operations platform. Every time a therapist
-> completes a session, a claim enters this pipeline. I'm going to start by kicking off
-> a simulation that compresses 3 days of billing activity into about 2 minutes — and
-> then walk through what's actually happening while it runs."
+> "This is Grow Therapy's internal billing operations platform. 6,400 claims,
+> 8 days of history. Every payer denial rate is flat — normal operating baseline.
+> I've paused the dashboard 3 days in the past. I'm going to advance it one day
+> at a time and show you an anomaly emerging in real time."
 
-**Action:** Click "⏩ Fast-forward" button on dashboard → amber progress banner appears.
-Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submitted"
+**Action:** Point at the trend chart — flat lines, all well below the orange 20% threshold.
+Point at the header: "Showing data through [date]".
 
 ---
 
-## SEGMENT 1 — THE QUEUE ARCHITECTURE (60 seconds)
+## SEGMENT 1 — THE WORKER ARCHITECTURE (60 seconds)
 
-> "The backend is FastAPI with a Celery task queue backed by Redis. Two independent
-> workers: a clearinghouse submission worker that picks up SUBMITTING claims from the
-> queue and handles the EDI round-trip — 80% go to SUBMITTED, 20% get clearinghouse
-> rejected. And a remittance batch processor on a Beat schedule that fires every 10
-> seconds, finds SUBMITTED claims, and adjudicates them with payer-specific denial rates.
+> "The backend is FastAPI, deployed as a Lambda container behind API Gateway. But the
+> interesting part is the async worker layer. Two independent workers replace what would
+> traditionally be a Celery + Redis setup.
+>
+> A clearinghouse submission worker — a separate Lambda triggered directly by SQS.
+> When a claim moves to SUBMITTING, the API enqueues a message; the SQS trigger fires
+> the Lambda with batchSize=1, handles the EDI round-trip — 80% go to SUBMITTED, 20%
+> get clearinghouse rejected — and the message is deleted on success. Three DLQ retries
+> on failure.
+>
+> A remittance batch processor — another Lambda on an EventBridge Scheduler, firing
+> every minute. It finds SUBMITTED claims and adjudicates them with payer-specific
+> denial rates.
 >
 > In a real Grow Therapy system these workers consume events from session completion
 > webhooks from the EHR, 835 file drops from the clearinghouse, and payer API polling.
 > The queue decouples receiving an event from processing it — the API acknowledges
-> immediately, the actual work happens in the background."
+> immediately, the actual work happens in the background. Workers scale to zero between
+> invocations."
 
-**Show:** Flower at `localhost:5555`
-- Connected workers, active tasks
-- Task history — submission and remittance tasks firing
-- Throughput chart ticking up
+**Show:** AWS Console — Lambda functions list, or locally: Flower at `localhost:5555`
+- If local: connected workers, active tasks, task history firing
+- If AWS: Lambda invocation metrics, SQS queue depth
 
-> "This is Flower — the Celery monitoring UI. An on-call engineer watching this at
-> 2am can see exactly what the workers are doing, which tasks are failing, and why.
-> That observability matters when you have 22,000 clinicians submitting claims."
-
-**Watch banner:** "Day 1 of 3 · 47 claims submitted"
+> "The entire infrastructure is defined in CDK TypeScript across five stacks —
+> network, data, API, workers, frontend. Cross-stack references are TypeScript object
+> properties, not string lookups. IAM policies are scoped to least privilege per Lambda."
 
 ---
 
@@ -90,24 +107,39 @@ Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submi
 
 ---
 
-## SEGMENT 4 — THE AETNA PATTERN (45 seconds)
+## SEGMENT 4 — THE AETNA ANOMALY (60 seconds)
 
-> "The dashboard is pulling aggregations from the claim event ledger, not the
-> claims table. Let's look at the denial rate by payer chart."
+> "The denial rate trend chart pulls from the event ledger — every ADJUDICATED to
+> PAID or DENIED event, grouped by day and payer. Right now: 8 flat days, all payers
+> 8 to 15%, nothing crosses the 20% alert threshold."
 
-**Show:** Dashboard BarChart — currently all payers near 12-15%, Aetna unremarkable
+**Show:** Trend chart — flat lines, Aetna indistinguishable from others.
 
-> "Historically, Aetna's denial rate on 90837 is about 15% — nothing alarming.
-> But the remittance batch worker I started at the beginning of this recording has
-> been adjudicating live claims at Aetna's real-world rate for 90837."
+> "Let me advance one day."
 
-**Show:** Watch Aetna's bar climb as fast-forward continues — now showing 25-30%. Switch to the CPT code denial rate chart — 90837 is the outlier, 90834 and 90832 are flat.
+**Action:** Click "⏩ Advance one day" — button shows "Writing day 1…" for ~5 seconds, then chart updates.
 
-> "That's not pre-baked into the historical data. The workers introduced it. By
-> the time the fast-forward finishes, you'll see Aetna's 90837 denial rate sitting at
-> 35% — roughly where it sits in the real behavioral health billing market. The CPT
-> code chart tells you exactly which procedure code is the problem. A billing manager
-> looking at this dashboard would know to investigate Aetna 90837 claims."
+> "Day t-minus-2 just landed. Aetna has crossed the 20% alert threshold —
+> every other payer is unchanged."
+
+**Show:** Aetna line clearly above the orange dashed 20% line. Other lines flat.
+
+> "One more."
+
+**Action:** Click again → chart updates.
+
+> "Two days in a row, Aetna climbing. This is what a real billing anomaly looks like —
+> it doesn't appear all at once, it builds."
+
+**Action:** Click once more → full spike.
+
+> "Three days of escalating denials. Flip to the CPT breakdown — 90837 is the outlier,
+> 90834 and 90832 are flat. That's Aetna's real-world denial rate on CPT 90837 in
+> behavioral health — a 45% denial rate on the most common therapy session code.
+> The dashboard tells you exactly which payer, which procedure code, and when it started.
+> A billing manager seeing this would open a denial review on Aetna 90837 that afternoon."
+
+**Show:** CPT denial rate bar chart — 90837 clearly elevated.
 
 ---
 
@@ -139,16 +171,17 @@ Banner reads: "Fast-forwarding billing activity — Day 1 of 3 · 0 claims submi
 > propagated from an upstream X-Request-ID header. It's bound via structlog
 > contextvars so every log line within that request carries it automatically.
 > Development is pretty console output; ENVIRONMENT=production switches to JSON,
-> one line per event, ready for Datadog."
+> one line per event, ready for CloudWatch or Datadog."
 
-**Show:** `docker compose logs worker` — structured log lines from the remittance processor
+**Show:** Lambda CloudWatch logs (production) or `docker compose logs worker` (local)
 
-> "What I'd add at production scale: replace Redis/Celery with SQS and Lambda so
-> workers scale to zero and the DLQ is a first-class infrastructure primitive rather
-> than configuration. OpenTelemetry tracing via X-Ray to stitch together the full
-> lifecycle across services. A denial classification service that turns CO-97 and PR-1
-> codes into structured action items for billing teams. And per-payer circuit breakers
-> to handle payer API instability without cascading failures."
+> "The infrastructure is live on AWS — Lambda, RDS, SQS, EventBridge, CloudFront,
+> DynamoDB, all defined in CDK TypeScript. What I'd add next: a GitHub Actions CI/CD
+> pipeline so every merge deploys automatically. OpenTelemetry tracing via X-Ray to
+> stitch together the full invocation chain. RDS Proxy to cap connection count at scale —
+> right now each Lambda cold start opens a fresh connection, which is fine at low
+> concurrency but doesn't scale. And a denial classification service that turns
+> CO-97 and PR-1 codes into structured action items with priority routing for billing teams."
 
 ---
 
