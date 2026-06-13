@@ -7,6 +7,7 @@ export function NavBar() {
     <nav className="bg-white border-b border-gray-200 px-6 py-3 flex items-center gap-8">
       <span className="font-semibold text-gray-900 text-sm tracking-tight">
         Grow Therapy <span className="text-gray-400 font-normal">· Billing Ops</span>
+        <span className="ml-2 text-xs font-normal text-gray-300">v1.0</span>
       </span>
       <div className="flex items-center gap-1">
         <NavLink href="/" active={pathname === '/'}>Dashboard</NavLink>
