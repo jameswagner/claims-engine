@@ -77,7 +77,9 @@ def transition(
                     idempotency_key=idempotency_key,
                 )
                 raise DuplicateTransitionError(
-                    f"Idempotency key {idempotency_key} was used for a different transition"
+                    f"Idempotency key {idempotency_key} conflicts with existing "
+                    f"{existing_event.from_status.value}→{existing_event.to_status.value} transition; "
+                    f"requested {from_status.value}→{to_status.value}"
                 )
             return TransitionResult(existing_event, True)
 

@@ -66,7 +66,7 @@ def test_denied_allows_resubmission():
 @patch("app.claims.state_machine.validate_claim", return_value=PASSING_RESULT)
 def test_created_to_validated(mock_validate):
     claim = make_claim(status=ClaimStatus.CREATED)
-    event = transition(claim, ClaimStatus.VALIDATED, make_db())
+    event = transition(claim, ClaimStatus.VALIDATED, make_db()).event
     assert event.from_status == ClaimStatus.CREATED
     assert event.to_status == ClaimStatus.VALIDATED
     assert claim.status == ClaimStatus.VALIDATED
@@ -74,33 +74,33 @@ def test_created_to_validated(mock_validate):
 
 def test_validated_to_submitted():
     claim = make_claim(status=ClaimStatus.VALIDATED)
-    event = transition(claim, ClaimStatus.SUBMITTED, make_db())
+    event = transition(claim, ClaimStatus.SUBMITTED, make_db()).event
     assert event.to_status == ClaimStatus.SUBMITTED
     assert claim.status == ClaimStatus.SUBMITTED
 
 
 def test_submitted_to_adjudicated():
     claim = make_claim(status=ClaimStatus.SUBMITTED)
-    event = transition(claim, ClaimStatus.ADJUDICATED, make_db())
+    event = transition(claim, ClaimStatus.ADJUDICATED, make_db()).event
     assert event.to_status == ClaimStatus.ADJUDICATED
 
 
 def test_adjudicated_to_paid():
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
-    event = transition(claim, ClaimStatus.PAID, make_db())
+    event = transition(claim, ClaimStatus.PAID, make_db()).event
     assert event.to_status == ClaimStatus.PAID
 
 
 def test_adjudicated_to_denied():
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
-    event = transition(claim, ClaimStatus.DENIED, make_db(), reason="Plan limit exceeded")
+    event = transition(claim, ClaimStatus.DENIED, make_db(), reason="Plan limit exceeded").event
     assert event.to_status == ClaimStatus.DENIED
     assert event.reason == "Plan limit exceeded"
 
 
 def test_denied_to_submitted_resubmission():
     claim = make_claim(status=ClaimStatus.DENIED)
-    event = transition(claim, ClaimStatus.SUBMITTED, make_db(), reason="Corrected codes")
+    event = transition(claim, ClaimStatus.SUBMITTED, make_db(), reason="Corrected codes").event
     assert event.to_status == ClaimStatus.SUBMITTED
     assert event.reason == "Corrected codes"
     assert claim.status == ClaimStatus.SUBMITTED
@@ -169,7 +169,7 @@ def test_no_duplicate_when_no_existing_event():
 def test_idempotency_key_written_to_event():
     claim = make_claim(status=ClaimStatus.VALIDATED)
     key = str(uuid.uuid4())
-    event = transition(claim, ClaimStatus.SUBMITTED, make_db(), idempotency_key=key)
+    event = transition(claim, ClaimStatus.SUBMITTED, make_db(), idempotency_key=key).event
     assert event.idempotency_key == key
 
 
@@ -183,7 +183,7 @@ def test_no_idempotency_key_skips_duplicate_check():
 
 def test_no_idempotency_key_event_has_none():
     claim = make_claim(status=ClaimStatus.VALIDATED)
-    event = transition(claim, ClaimStatus.SUBMITTED, make_db())
+    event = transition(claim, ClaimStatus.SUBMITTED, make_db()).event
     assert event.idempotency_key is None
 
 
@@ -240,8 +240,8 @@ def test_failed_validation_does_not_mutate_claim_status(mock_validate):
 def test_db_add_called_with_event(mock_validate):
     claim = make_claim(status=ClaimStatus.CREATED)
     db = make_db()
-    event = transition(claim, ClaimStatus.VALIDATED, db)
-    db.add.assert_called_once_with(event)
+    result = transition(claim, ClaimStatus.VALIDATED, db)
+    db.add.assert_called_once_with(result.event)
 
 
 @patch("app.claims.state_machine.validate_claim", return_value=PASSING_RESULT)
@@ -254,11 +254,11 @@ def test_db_flush_called(mock_validate):
 
 def test_reason_is_none_by_default():
     claim = make_claim(status=ClaimStatus.SUBMITTED)
-    event = transition(claim, ClaimStatus.ADJUDICATED, make_db())
+    event = transition(claim, ClaimStatus.ADJUDICATED, make_db()).event
     assert event.reason is None
 
 
 def test_reason_passed_through_to_event():
     claim = make_claim(status=ClaimStatus.ADJUDICATED)
-    event = transition(claim, ClaimStatus.DENIED, make_db(), reason="Exceeded benefit limit")
+    event = transition(claim, ClaimStatus.DENIED, make_db(), reason="Exceeded benefit limit").event
     assert event.reason == "Exceeded benefit limit"
