@@ -39,6 +39,7 @@ class ClaimRead(BaseModel):
     paid_amount: Decimal | None = None
     patient_responsibility: Decimal | None = None
     adjustment_reason: str | None = None
+    place_of_service: str | None = None
     created_at: datetime
     updated_at: datetime
 

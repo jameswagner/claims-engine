@@ -32,6 +32,7 @@ PATIENT_NAMES = [
 ]
 
 BILLED_RANGE = {"90837": (200, 280), "90834": (160, 220), "90832": (130, 175)}
+PLACE_OF_SERVICE_CHOICES = ["telehealth", "in-office"]
 
 DENIAL_REASONS = [
     "CO-97: procedure bundled, not separately payable",
@@ -147,12 +148,13 @@ def reset_cursor() -> None:
         db.close()
 
 
-def _denial_rate(payer: str, cpt_code: str, rates: dict) -> float:
-    return (
+def _denial_rate(payer: str, cpt_code: str, rates: dict, place_of_service: str) -> float:
+    base = (
         rates.get((payer, cpt_code))
         or rates.get((payer, None))
         or rates[(None, None)]
     )
+    return base + 0.05 if place_of_service == "telehealth" else base
 
 
 def _adj_days(payer: str) -> int:
@@ -203,9 +205,10 @@ def advance_one_day() -> dict:
             validated_at = submitted_at - timedelta(days=random.randint(1, 2), hours=random.randint(1, 6))
             created_at = validated_at - timedelta(days=random.randint(1, 2), hours=random.randint(1, 6))
 
+            pos = random.choices(PLACE_OF_SERVICE_CHOICES, weights=[60, 40])[0]
             lo, hi = BILLED_RANGE[cpt_code]
             billed = Decimal(str(round(random.uniform(lo, hi), 2))).quantize(Decimal("0.01"))
-            is_denied = random.random() < _denial_rate(payer, cpt_code, rates)
+            is_denied = random.random() < _denial_rate(payer, cpt_code, rates, pos)
             denial_reason = random.choice(DENIAL_REASONS) if is_denied else None
 
             if is_denied:
@@ -230,6 +233,7 @@ def advance_one_day() -> dict:
                 patient_responsibility=patient_resp,
                 paid_amount=paid_amt,
                 adjustment_reason=denial_reason if is_denied else None,
+                place_of_service=pos,
                 created_at=created_at,
                 updated_at=resolved_at,
             )

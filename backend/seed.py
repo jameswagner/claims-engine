@@ -82,12 +82,15 @@ BILLED_RANGE: dict[str, tuple[int, int]] = {
 }
 
 
-def _denial_rate(payer: str, cpt_code: str) -> float:
-    return (
+PLACE_OF_SERVICE_CHOICES = ["telehealth", "in-office"]
+
+def _denial_rate(payer: str, cpt_code: str, place_of_service: str) -> float:
+    base = (
         _NORMAL_RATES.get((payer, cpt_code))
         or _NORMAL_RATES.get((payer, None))
         or _NORMAL_RATES[(None, None)]
     )
+    return base + 0.05 if place_of_service == "telehealth" else base
 
 
 def _adj_days(payer: str) -> int:
@@ -133,9 +136,10 @@ def _seed_day(db, day_date: date, count: int) -> None:
         validated_at = submitted_at - timedelta(days=random.randint(1, 2), hours=random.randint(1, 6))
         created_at = validated_at - timedelta(days=random.randint(1, 2), hours=random.randint(1, 6))
 
+        pos = random.choices(PLACE_OF_SERVICE_CHOICES, weights=[60, 40])[0]
         lo, hi = BILLED_RANGE[cpt_code]
         billed = Decimal(str(round(random.uniform(lo, hi), 2))).quantize(Decimal("0.01"))
-        is_denied = random.random() < _denial_rate(payer, cpt_code)
+        is_denied = random.random() < _denial_rate(payer, cpt_code, pos)
         denial_reason = random.choice(DENIAL_REASONS) if is_denied else None
 
         if is_denied:
@@ -162,6 +166,7 @@ def _seed_day(db, day_date: date, count: int) -> None:
             patient_responsibility=patient_resp,
             paid_amount=paid_amt,
             adjustment_reason=denial_reason if is_denied else None,
+            place_of_service=pos,
             created_at=created_at,
             updated_at=resolved_at,
         )

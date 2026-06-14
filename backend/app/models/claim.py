@@ -29,6 +29,7 @@ class Claim(Base):
     paid_amount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     patient_responsibility: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     adjustment_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    place_of_service: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

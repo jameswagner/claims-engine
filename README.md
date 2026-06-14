@@ -1,5 +1,7 @@
 # Grow Therapy Billing Ops Platform
 
+[![CI / CD](https://github.com/jameswagner/claims-engine/actions/workflows/ci.yml/badge.svg)](https://github.com/jameswagner/claims-engine/actions/workflows/ci.yml)
+
 An internal billing operations platform for monitoring and processing insurance claims across a therapy network at scale. Users are ops staff tracking thousands of therapists' claims across dozens of payers — not individual clinicians submitting their own claims. Every transition is validated against a database-driven rules engine, every state change writes an immutable audit event, duplicate submissions are rejected at both the application and database level, and a Celery task queue handles asynchronous clearinghouse and remittance work.
 
 ---

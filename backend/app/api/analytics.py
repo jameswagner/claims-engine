@@ -63,6 +63,14 @@ class DenialRateDailyPoint(BaseModel):
     denial_rate_pct: float
 
 
+class PosDenialRate(BaseModel):
+    payer: str
+    place_of_service: str
+    total: int
+    denied: int
+    denial_rate_pct: float
+
+
 class ClaimsAnalytics(BaseModel):
     claims_by_status: dict[str, int]
     denial_rate_by_payer: list[PayerDenialRate]
@@ -314,4 +322,42 @@ def get_denial_rate_timeseries(db: Session = Depends(get_db)) -> Any:
             denial_rate_pct=round(v["denied"] / v["total"] * 100, 1) if v["total"] else 0.0,
         )
         for k, v in sorted(points.items())
+    ]
+
+
+@router.get("/denial-rate-by-pos", response_model=list[PosDenialRate])
+def get_denial_rate_by_pos(db: Session = Depends(get_db)) -> Any:
+    rows = db.execute(
+        select(
+            Claim.insurance_payer,
+            Claim.place_of_service,
+            ClaimEvent.to_status,
+            func.count().label("n"),
+        )
+        .join(Claim, Claim.id == ClaimEvent.claim_id)
+        .where(ClaimEvent.from_status == ClaimStatus.ADJUDICATED)
+        .where(ClaimEvent.to_status.in_([ClaimStatus.PAID, ClaimStatus.DENIED]))
+        .where(Claim.place_of_service.isnot(None))
+        .group_by(Claim.insurance_payer, Claim.place_of_service, ClaimEvent.to_status)
+        .order_by(Claim.insurance_payer, Claim.place_of_service)
+    ).all()
+
+    buckets: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        key = (row.insurance_payer, row.place_of_service)
+        if key not in buckets:
+            buckets[key] = {"total": 0, "denied": 0}
+        buckets[key]["total"] += row.n
+        if row.to_status == ClaimStatus.DENIED:
+            buckets[key]["denied"] += row.n
+
+    return [
+        PosDenialRate(
+            payer=k[0],
+            place_of_service=k[1],
+            total=v["total"],
+            denied=v["denied"],
+            denial_rate_pct=round(v["denied"] / v["total"] * 100, 1) if v["total"] else 0.0,
+        )
+        for k, v in sorted(buckets.items())
     ]
