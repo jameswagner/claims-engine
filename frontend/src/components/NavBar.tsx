@@ -1,5 +1,6 @@
 import { Link, useLocation } from 'react-router-dom'
 
+// NavBar: wordmark + nav links. Version label increments with each release.
 export function NavBar() {
   const { pathname } = useLocation()
 
