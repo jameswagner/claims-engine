@@ -109,6 +109,22 @@ jobs:
         run: npx cdk deploy claims-api claims-workers --require-approval never
         working-directory: cdk
 
+      # Wake RDS if the cost-saving stop schedule parked it. Starting an already-
+      # running instance returns an error we ignore; wait is a no-op if available.
+      - name: Ensure RDS is running
+        if: steps.changes.outputs.backend == 'true'
+        run: |
+          STATUS=$(aws rds describe-db-instances \
+            --db-instance-identifier claims-db \
+            --query 'DBInstances[0].DBInstanceStatus' \
+            --output text)
+          echo "RDS status: $STATUS"
+          if [ "$STATUS" != "available" ]; then
+            aws rds start-db-instance --db-instance-identifier claims-db || true
+            aws rds wait db-instance-available --db-instance-identifier claims-db
+            echo "RDS now available"
+          fi
+
       # Run Alembic migrations via the Lambda's task handler so they execute
       # inside the VPC against the real RDS instance.
       - name: Run database migrations
