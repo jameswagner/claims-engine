@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { Bar, BarChart, Cell, Legend, Line, LineChart, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
-import { fetchAnalytics, fetchDenialRateTimeseries, resetFastForward, stepFastForward } from '../api/analytics'
+import { fetchAnalytics, fetchDenialRateByPos, fetchDenialRateTimeseries, resetFastForward, stepFastForward } from '../api/analytics'
 import { NavBar } from '../components/NavBar'
-import type { ClaimsAnalytics, DenialRateDailyPoint } from '../types/claim'
+import type { ClaimsAnalytics, DenialRateDailyPoint, PosDenialRate } from '../types/claim'
 
 function MetricCard({ label, value, sub }: { label: string; value: string | number; sub?: string }) {
   return (
@@ -68,6 +68,7 @@ function buildTimeseriesChartData(points: DenialRateDailyPoint[], cutoff: Date) 
 export function Dashboard() {
   const [analytics, setAnalytics] = useState<ClaimsAnalytics | null>(null)
   const [timeseries, setTimeseries] = useState<DenialRateDailyPoint[] | null>(null)
+  const [posDenialRates, setPosDenialRates] = useState<PosDenialRate[] | null>(null)
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null)
   const [, setTick] = useState(0)
 
@@ -84,6 +85,7 @@ export function Dashboard() {
       return Promise.all([
         fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
         fetchDenialRateTimeseries().then(setTimeseries),
+        fetchDenialRateByPos().then(setPosDenialRates),
       ]).catch(() => {})
     }
     // Sync FF cursor from backend so page refresh shows correct button state
@@ -116,6 +118,7 @@ export function Dashboard() {
       await Promise.all([
         fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
         fetchDenialRateTimeseries().then(setTimeseries),
+        fetchDenialRateByPos().then(setPosDenialRates),
       ])
     } catch (e: unknown) {
       setFfError(e instanceof Error ? e.message : 'Failed')
@@ -134,6 +137,7 @@ export function Dashboard() {
       await Promise.all([
         fetchAnalytics().then(a => { setAnalytics(a); setLastUpdated(new Date()) }),
         fetchDenialRateTimeseries().then(setTimeseries),
+        fetchDenialRateByPos().then(setPosDenialRates),
       ])
     } catch {
       // ignore
@@ -289,6 +293,40 @@ export function Dashboard() {
               </ResponsiveContainer>
             ) : (
               <div className="h-[220px] flex items-center justify-center text-gray-400 text-sm">Loading…</div>
+            )}
+          </div>
+
+          {/* Denial rate by place of service */}
+          <div className="bg-white rounded-xl border border-gray-200 p-6">
+            <h2 className="text-sm font-semibold text-gray-700 mb-1">Denial Rate by Service Type</h2>
+            <p className="text-xs text-gray-400 mb-4">Telehealth vs in-office · all adjudicated claims</p>
+            {posDenialRates && posDenialRates.length > 0 ? (() => {
+              const payers = [...new Set(posDenialRates.map(r => r.payer))].sort()
+              const chartData = payers.map(payer => {
+                const telehealth = posDenialRates.find(r => r.payer === payer && r.place_of_service === 'telehealth')
+                const inOffice = posDenialRates.find(r => r.payer === payer && r.place_of_service === 'in-office')
+                return {
+                  payer,
+                  telehealth: telehealth?.denial_rate_pct ?? 0,
+                  'in-office': inOffice?.denial_rate_pct ?? 0,
+                }
+              })
+              return (
+                <ResponsiveContainer width="100%" height={220}>
+                  <BarChart data={chartData} margin={{ top: 4, right: 8, left: -16, bottom: 0 }}>
+                    <XAxis dataKey="payer" tick={{ fontSize: 10 }} />
+                    <YAxis tick={{ fontSize: 11 }} tickFormatter={v => `${v}%`} domain={[0, 'auto']} />
+                    <Tooltip formatter={(v) => [`${Number(v ?? 0).toFixed(1)}%`, '']} />
+                    <Legend wrapperStyle={{ fontSize: 12 }} />
+                    <Bar dataKey="telehealth" name="Telehealth" fill="#6366f1" radius={[3, 3, 0, 0]} />
+                    <Bar dataKey="in-office" name="In-office" fill="#10b981" radius={[3, 3, 0, 0]} />
+                  </BarChart>
+                </ResponsiveContainer>
+              )
+            })() : (
+              <div className="h-[220px] flex items-center justify-center text-gray-400 text-sm">
+                {posDenialRates === null ? 'Loading…' : 'No data'}
+              </div>
             )}
           </div>
 

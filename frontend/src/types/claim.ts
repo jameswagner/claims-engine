@@ -75,6 +75,14 @@ export interface DenialRateDailyPoint {
   denial_rate_pct: number
 }
 
+export interface PosDenialRate {
+  payer: string
+  place_of_service: string
+  total: number
+  denied: number
+  denial_rate_pct: number
+}
+
 export interface FastForwardStatus {
   running: boolean
   day: number

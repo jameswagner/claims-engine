@@ -1,4 +1,4 @@
-import type { ClaimsAnalytics, DenialRateDailyPoint, FastForwardResult, FastForwardStatus } from '../types/claim'
+import type { ClaimsAnalytics, DenialRateDailyPoint, FastForwardResult, FastForwardStatus, PosDenialRate } from '../types/claim'
 
 const BASE = import.meta.env.VITE_API_URL
 
@@ -20,6 +20,8 @@ async function post<T>(path: string): Promise<T> {
 export const fetchAnalytics = () => get<ClaimsAnalytics>('/analytics/claims')
 
 export const fetchDenialRateTimeseries = () => get<DenialRateDailyPoint[]>('/analytics/denial-rate-timeseries')
+
+export const fetchDenialRateByPos = () => get<PosDenialRate[]>('/analytics/denial-rate-by-pos')
 
 export const fetchFastForwardStatus = () => get<FastForwardStatus>('/demo/fast-forward/status')
 
