@@ -97,11 +97,20 @@ curl -X POST http://localhost:8000/demo/fast-forward/reset  # replay from scratc
 | API docs     | http://localhost:8000/docs   |
 | Flower (tasks) | http://localhost:5555      |
 
-**Run tests:**
+**Run tests (no Docker required — tests mock the database):**
 
 ```bash
 cd backend
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
 .venv/bin/pytest tests/ -v
+```
+
+**Run the backend directly (requires a local Postgres instance):**
+
+```bash
+cd backend
+DATABASE_URL=postgresql://claims:claims@localhost:5432/claims .venv/bin/python -m uvicorn app.main:app --reload --port 8000
 ```
 
 ---
@@ -162,7 +171,7 @@ cd backend
 
 - **What's deployed on AWS.** The app is live on AWS: Lambda (Docker/Mangum) behind HTTP API Gateway v2 for the API, SQS-triggered Lambda for clearinghouse submissions, EventBridge Scheduler for remittance batches, RDS Postgres 15 for the database, S3 + CloudFront for the frontend, DynamoDB for demo cursor state, and Secrets Manager for credentials. All infrastructure is defined in CDK TypeScript across five stacks with cross-stack TypeScript references, IAM managed policies scoped to least privilege, and VPC endpoints routing AWS API calls within the VPC without a NAT gateway.
 
-- **What I'd add next.** A GitHub Actions CI/CD pipeline — run tests on pull requests, `cdk deploy` on merge to main. OpenTelemetry tracing via X-Ray to stitch together the full invocation chain across API Gateway → API Lambda → Worker Lambda. RDS Proxy to cap connection count at scale (each Lambda cold start opens a new connection — fine at low concurrency, breaks at high). A denial classification service that turns remit codes (CO-97, PR-1) into structured action items with priority routing for billing teams. Per-payer circuit breakers to isolate payer API instability. WAF on the API Gateway for production.
+- **What I'd add next.** OpenTelemetry tracing via X-Ray to stitch together the full invocation chain across API Gateway → API Lambda → Worker Lambda. RDS Proxy to cap connection count at scale (each Lambda cold start opens a new connection — fine at low concurrency, breaks at high). A denial classification service that turns remit codes (CO-97, PR-1) into structured action items with priority routing for billing teams. Per-payer circuit breakers to isolate payer API instability. WAF on the API Gateway for production.
 
 ---
 
